@@ -76,6 +76,16 @@ class BilevelSemanticControllerTest(unittest.TestCase):
         )
         support = self._state_for(controller, 21, compute_hvp=False)
         query = self._state_for(controller, 22, compute_hvp=False)
+        relation_state = support["relation_state"]
+        route, _ = controller.router(
+            torch.rand(self.batch, self.parts),
+            torch.rand(self.batch, controller.num_relations),
+            support["curvature"],
+            relation_state["curvature"],
+        )
+        self.assertEqual(tuple(route.shape), (self.batch, 3, 3))
+        expected_prior = controller.router.prior.view(1, 1, 3).expand_as(route)
+        self.assertTrue(torch.allclose(route, expected_prior))
         generator = torch.Generator().manual_seed(23)
         targets = torch.randn(
             self.batch, 3, self.dim, generator=generator

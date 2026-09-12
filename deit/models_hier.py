@@ -318,6 +318,8 @@ class HierVisionTransformer(VisionTransformer):
         ``(B, 3)``.  Keeping the losses unreduced lets each paired support/query
         example receive its own task-specific counterfactual route.
         """
+        if float(consistency_weight) < 0:
+            raise ValueError('meta consistency weight must be nonnegative')
         adapted = self.bilevel.adapt_parts(
             state['part_tokens'].detach().float(), adapter_params
         )
