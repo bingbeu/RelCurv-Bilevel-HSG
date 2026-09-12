@@ -179,3 +179,4 @@ Hierarchical Visual Recognition* and builds on H-CAST, CHMatch, DeiT, and timm.
 Please retain the upstream attribution and license when publishing derivatives.
 
 See `LICENSE` and the upstream citation information for details.
+
