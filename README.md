@@ -48,7 +48,7 @@ random initialization unless `--allow-random-init` is passed explicitly.
 ```bash
 CUDA_VISIBLE_DEVICES=3 python deit/main_hier_partial.py \
   --model deit_small_patch16_224 \
-  --batch-size 32 --epochs 100 --lr 5e-4 \
+  --batch-size 256 --epochs 100 --lr 5e-4 \
   --weight-decay 0.05 --warmup-epochs 5 \
   --seed 0 --random_seed 0 --num_workers 8 \
   --data-set AIR-HIER \
@@ -80,7 +80,7 @@ Use the same adaptive method with the official CUB proportions and paths:
 ```bash
 CUDA_VISIBLE_DEVICES=3 python deit/main_hier_partial.py \
   --model deit_small_patch16_224 \
-  --batch-size 32 --epochs 100 --lr 5e-4 \
+  --batch-size 256 --epochs 100 --lr 5e-4 \
   --weight-decay 0.05 --warmup-epochs 5 \
   --seed 0 --random_seed 0 --num_workers 8 \
   --data-set BIRD-HIER --data-path /data/CUB_200_2011/images_split \
