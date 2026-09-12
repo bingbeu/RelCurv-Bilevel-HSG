@@ -93,6 +93,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                 caps_embed,
                 # Avoid relation-level second derivatives during warm-up.
                 compute_hvp=(meta_active if args.enable_bilevel else None),
+                build_relations=(meta_active if args.enable_bilevel else None),
             )
             sim_loss = torch.tensor(0.0)  
             outputs, sub_out, basic_out, feats, family_feat, order_feat, part_aux_loss, *extra = out
@@ -161,11 +162,31 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             # update.  Backbone gradients are intentionally disabled here.
             with torch.no_grad():
                 with torch.cuda.amp.autocast():
-                    query_out = model(query_samples, caps_model_embed, compute_hvp=False)
+                    query_out = model(
+                        query_samples,
+                        caps_model_embed,
+                        compute_hvp=False,
+                        build_relations=True,
+                    )
                 query_meta_state = query_out[-1]
 
             # Meta step: exact hypergradient of the one-step unrolled objective.
             # Only phi (the policy) is updated; theta/psi are untouched here.
+            def outer_task_fn(state, fast_params, reference):
+                return core_model.bilevel_task_loss(
+                    state,
+                    fast_params,
+                    reference,
+                    fine_targets,
+                    sub_targets,
+                    basic_targets,
+                    leaf_index,
+                    sub_index,
+                    fine_weight=args.meta_fine_weight,
+                    family_weight=args.meta_family_weight,
+                    basic_weight=args.meta_basic_weight,
+                )
+
             with torch.cuda.amp.autocast(enabled=False):
                 meta_loss, meta_stats = core_model.bilevel.meta_objective(
                     support_meta_state,
@@ -175,6 +196,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     kl_weight=args.meta_kl_weight,
                     scope=args.meta_scope,
                     relation_weight=args.meta_relation_weight,
+                    outer_task_fn=outer_task_fn,
+                    task_weight=args.meta_task_weight,
+                    semantic_weight=args.meta_semantic_weight,
+                    router_kl_weight=args.meta_router_kl_weight,
                 )
             policy_params = tuple(
                 core_model.bilevel.policy_parameters(args.meta_scope)
@@ -182,6 +207,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             policy_grads = torch.autograd.grad(
                 meta_loss, policy_params, allow_unused=False
             )
+            policy_grad_norm = torch.sqrt(sum(
+                grad.detach().float().square().sum() for grad in policy_grads
+            ))
+            meta_stats['meta_policy_grad_norm'] = policy_grad_norm
+            meta_stats['meta_policy_grad_norm_x1e6'] = policy_grad_norm * 1.0e6
             meta_optimizer.zero_grad(set_to_none=True)
             for param, grad in zip(policy_params, policy_grads):
                 param.grad = grad.detach()

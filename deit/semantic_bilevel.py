@@ -13,7 +13,7 @@ Only the post-update outer objective updates ``phi``.
 import math
 from collections import OrderedDict
 from contextlib import nullcontext
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -156,6 +156,60 @@ class CurvatureSemanticWeightPolicy(nn.Module):
         }
 
 
+class AdaptiveGranularityRouter(nn.Module):
+    """Meta-policy over skip, local-part and relation semantic updates."""
+
+    def __init__(
+        self,
+        hidden_dim: int = 32,
+        prior=(0.50, 0.45, 0.05),
+    ):
+        super().__init__()
+        prior_tensor = torch.as_tensor(prior, dtype=torch.float32)
+        if prior_tensor.numel() != 3 or (prior_tensor <= 0).any():
+            raise ValueError("router prior must contain three positive values")
+        prior_tensor = prior_tensor / prior_tensor.sum()
+        self.register_buffer("prior", prior_tensor)
+        self.net = nn.Sequential(
+            nn.LayerNorm(8),
+            nn.Linear(8, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 3),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        with torch.no_grad():
+            self.net[-1].bias.copy_(prior_tensor.log())
+
+    def forward(
+        self,
+        part_error: torch.Tensor,
+        relation_error: torch.Tensor,
+        part_curvature: torch.Tensor,
+        relation_curvature: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        def moments(value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            value = value.detach().float()
+            return value.mean(dim=1), value.std(dim=1, unbiased=False)
+
+        pe_mean, pe_std = moments(part_error)
+        re_mean, re_std = moments(relation_error)
+        pc_mean, pc_std = moments(part_curvature)
+        rc_mean, rc_std = moments(relation_curvature)
+        features = torch.stack(
+            (pe_mean, pe_std, re_mean, re_std,
+             pc_mean, pc_std, rc_mean, rc_std),
+            dim=-1,
+        )
+        route = torch.softmax(self.net(features), dim=-1)
+        entropy = -(route * route.clamp_min(1e-8).log()).sum(dim=-1)
+        return route, {
+            "route_skip": route[:, 0].mean().detach(),
+            "route_part": route[:, 1].mean().detach(),
+            "route_relation": route[:, 2].mean().detach(),
+            "route_entropy": entropy.mean().detach(),
+        }
+
+
 class PairwiseRelationEncoder(nn.Module):
     """Encode all undirected part pairs as appearance-layout relations.
 
@@ -164,23 +218,28 @@ class PairwiseRelationEncoder(nn.Module):
     spread difference, and soft-attention overlap.
     """
 
-    def __init__(self, dim: int, num_parts: int):
+    def __init__(self, dim: int, num_parts: int, relation_dim: int = 64):
         super().__init__()
         if num_parts < 2:
             raise ValueError("relation modeling needs at least two parts")
         self.dim = dim
+        self.relation_dim = relation_dim
         self.num_parts = num_parts
         self.register_buffer(
             "pair_index", torch.triu_indices(num_parts, num_parts, offset=1),
             persistent=False,
         )
         self.visual_encoder = nn.Sequential(
-            nn.LayerNorm(2 * dim + 6), nn.Linear(2 * dim + 6, dim),
-            nn.GELU(), nn.Linear(dim, dim),
+            nn.LayerNorm(2 * dim + 6),
+            nn.Linear(2 * dim + 6, relation_dim),
+            nn.GELU(),
+            nn.LayerNorm(relation_dim),
         )
         self.semantic_encoder = nn.Sequential(
-            nn.LayerNorm(2 * dim), nn.Linear(2 * dim, dim),
-            nn.GELU(), nn.Linear(dim, dim),
+            nn.LayerNorm(2 * dim),
+            nn.Linear(2 * dim, relation_dim),
+            nn.GELU(),
+            nn.LayerNorm(relation_dim),
         )
         # A moving target encoder lets the relation loss minimize itself by
         # changing both sides.  Keep this mapping fixed: relation supervision
@@ -255,7 +314,7 @@ class PairwiseRelationEncoder(nn.Module):
 class BilevelSemanticController(nn.Module):
     """Part- and relation-level one-step differentiable bilevel controller."""
 
-    VALID_SCOPES = ("part", "relation", "hybrid")
+    VALID_SCOPES = ("part", "relation", "hybrid", "adaptive")
 
     def __init__(
         self, dim: int, text_dim: int, num_parts: int, semantic_rank: int = 64,
@@ -265,6 +324,9 @@ class BilevelSemanticController(nn.Module):
         relation_hvp_samples: int = 1,
         relation_contrastive_weight: float = 0.1,
         relation_temperature: float = 0.1,
+        relation_dim: int = 64,
+        router_hidden_dim: int = 32,
+        router_prior=(0.50, 0.45, 0.05),
     ):
         super().__init__()
         if relation_hvp_samples < 1:
@@ -279,16 +341,21 @@ class BilevelSemanticController(nn.Module):
             raise ValueError("relation_temperature must be positive")
         self.relation_contrastive_weight = float(relation_contrastive_weight)
         self.relation_temperature = float(relation_temperature)
+        self.relation_dim = int(relation_dim)
         self.bridge = SemanticTokenBridge(dim, text_dim, num_parts, semantic_rank)
         self.adapter = LowRankSemanticAdapter(dim, adapter_rank)
         self.policy = CurvatureSemanticWeightPolicy(
             dim, policy_hidden_dim, policy_tau, reference_mix
         )
         if self.enable_relations:
-            self.relation_encoder = PairwiseRelationEncoder(dim, num_parts)
-            self.relation_adapter = LowRankSemanticAdapter(dim, adapter_rank)
+            self.relation_encoder = PairwiseRelationEncoder(
+                dim, num_parts, relation_dim=self.relation_dim
+            )
             self.relation_policy = CurvatureSemanticWeightPolicy(
-                dim, policy_hidden_dim, policy_tau, reference_mix
+                self.relation_dim, policy_hidden_dim, policy_tau, reference_mix
+            )
+            self.router = AdaptiveGranularityRouter(
+                hidden_dim=router_hidden_dim, prior=router_prior
             )
 
     @property
@@ -321,20 +388,27 @@ class BilevelSemanticController(nn.Module):
             "curvature": curvature,
         }
 
-    @staticmethod
-    def _alignment_error(
-        adapter: LowRankSemanticAdapter, visual_tokens: torch.Tensor,
-        target_semantics: torch.Tensor,
+    def adapt_parts(
+        self, part_tokens: torch.Tensor,
         params: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Shared lower-level variable used by all semantic granularities."""
+        adapter_dtype = next(self.adapter.parameters()).dtype
+        tokens = part_tokens.to(dtype=adapter_dtype)
+        if params is None:
+            return self.adapter(tokens)
+        return self.adapter.functional_forward(tokens, params)
+
+    @staticmethod
+    def _direct_alignment_error(
+        visual_tokens: torch.Tensor,
+        target_semantics: torch.Tensor,
         contrastive_weight: float = 0.0,
         temperature: float = 0.1,
     ) -> torch.Tensor:
-        adapted = (
-            adapter(visual_tokens) if params is None
-            else adapter.functional_forward(visual_tokens, params)
-        )
+        target_semantics = target_semantics.to(dtype=visual_tokens.dtype)
         cosine_error = 1.0 - F.cosine_similarity(
-            adapted, target_semantics, dim=-1
+            visual_tokens, target_semantics, dim=-1
         )
         if contrastive_weight <= 0:
             return cosine_error
@@ -342,7 +416,7 @@ class BilevelSemanticController(nn.Module):
         # Every relation must match its own semantic edge rather than a shared
         # constant vector.  reduction='none' retains one selectable error per
         # edge, which is required by the bilevel policy.
-        adapted_norm = F.normalize(adapted, dim=-1)
+        adapted_norm = F.normalize(visual_tokens, dim=-1)
         target_norm = F.normalize(target_semantics, dim=-1)
         logits = torch.matmul(
             adapted_norm, target_norm.transpose(1, 2)
@@ -361,20 +435,31 @@ class BilevelSemanticController(nn.Module):
         self, visual_tokens: torch.Tensor, target_semantics: torch.Tensor,
         params: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        return self._alignment_error(self.adapter, visual_tokens, target_semantics, params)
+        adapted = self.adapt_parts(visual_tokens, params)
+        return self._direct_alignment_error(adapted, target_semantics)
 
     def relation_alignment_error(
         self, visual_relations: torch.Tensor, target_relations: torch.Tensor,
-        params: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        return self._alignment_error(
-            self.relation_adapter,
+        return self._direct_alignment_error(
             visual_relations,
             target_relations,
-            params,
             contrastive_weight=self.relation_contrastive_weight,
             temperature=self.relation_temperature,
         )
+
+    @staticmethod
+    def reference_distribution(
+        error: torch.Tensor, curvature: torch.Tensor, q_mode: str,
+    ) -> torch.Tensor:
+        if q_mode == "uniform":
+            q = torch.full_like(error, 1.0 / error.size(1))
+        elif q_mode == "hvp":
+            q = curvature.squeeze(-1) if curvature.dim() == 3 else curvature
+            q = q / q.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        else:
+            raise ValueError("meta q_mode must be 'uniform' or 'hvp'")
+        return q.detach()
 
     @staticmethod
     def _stopped_policy_distribution(
@@ -414,7 +499,8 @@ class BilevelSemanticController(nn.Module):
         curvature: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         p, stats = self.policy_distribution(part_tokens, policy_semantics, curvature)
-        return (p.detach().unsqueeze(-1) * part_tokens).sum(dim=1), stats
+        adapted = self.adapt_parts(part_tokens)
+        return (p.detach().unsqueeze(-1) * adapted).sum(dim=1), stats
 
     def pool_relations(
         self, relation_state: Dict[str, torch.Tensor]
@@ -442,11 +528,7 @@ class BilevelSemanticController(nn.Module):
             with fp32_context:
                 z = relation_tokens.detach().float().requires_grad_(True)
                 target = target_relations.detach().float()
-                frozen_params = OrderedDict(
-                    (name, param.detach().float())
-                    for name, param in self.relation_adapter.named_parameters()
-                )
-                error = self.relation_alignment_error(z, target, frozen_params)
+                error = self.relation_alignment_error(z, target)
                 gradient = torch.autograd.grad(
                     error.mean(), z, create_graph=True, retain_graph=True
                 )[0]
@@ -471,8 +553,9 @@ class BilevelSemanticController(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         if not self.enable_relations:
             raise RuntimeError("relation controller is disabled")
+        adapted_parts = self.adapt_parts(part_tokens)
         visual_relations, geometry = self.relation_encoder.visual_relations(
-            part_tokens, part_attn
+            adapted_parts, part_attn
         )
         # Both policy context and target are semantic evidence, not trainable
         # shortcuts for the real alignment loss.  The visual relation tokens
@@ -488,6 +571,8 @@ class BilevelSemanticController(nn.Module):
             if compute_hvp else self._endpoint_prior(part_curvature.detach())
         )
         return {
+            "part_tokens": part_tokens,
+            "part_attn": part_attn,
             "tokens": visual_relations,
             "policy_semantics": policy_relations,
             "target_semantics": target_relations,
@@ -495,34 +580,132 @@ class BilevelSemanticController(nn.Module):
             "geometry": geometry,
         }
 
-    @staticmethod
-    def _single_meta_objective(
-        support: Dict[str, torch.Tensor], query: Dict[str, torch.Tensor],
-        policy: CurvatureSemanticWeightPolicy, adapter: LowRankSemanticAdapter,
-        num_items: int, inner_lr: float, q_mode: str, kl_weight: float,
-        prefix: str,
-        contrastive_weight: float = 0.0,
-        temperature: float = 0.1,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        support_tokens = support["tokens"].detach().float()
-        support_policy_sem = support["policy_semantics"].detach().float()
-        support_target_sem = support["target_semantics"].detach().float()
-        support_curvature = support["curvature"].detach().float()
-        query_tokens = query["tokens"].detach().float()
-        query_target_sem = query["target_semantics"].detach().float()
-        query_curvature = query["curvature"].detach().float()
+    @classmethod
+    def _check_scope(cls, scope: str) -> None:
+        if scope not in cls.VALID_SCOPES:
+            raise ValueError(f"meta scope must be one of {cls.VALID_SCOPES}")
 
-        p, policy_stats = policy(support_tokens, support_policy_sem, support_curvature)
-        base_params = OrderedDict(adapter.named_parameters())
-        support_error = BilevelSemanticController._alignment_error(
-            adapter,
-            support_tokens,
-            support_target_sem,
-            base_params,
-            contrastive_weight=contrastive_weight,
-            temperature=temperature,
+    @staticmethod
+    def _policy_kl(policy: torch.Tensor) -> torch.Tensor:
+        uniform = torch.full_like(policy, 1.0 / policy.size(1))
+        return (
+            policy * (policy.clamp_min(1e-8).log() - uniform.log())
+        ).sum(dim=1).mean()
+
+    def _relation_tokens(
+        self, relation_state: Dict[str, torch.Tensor],
+        adapter_params: Optional[Dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        adapted = self.adapt_parts(
+            relation_state["part_tokens"].detach().float(), adapter_params
         )
-        inner_loss = (num_items * p * support_error).mean()
+        attention = relation_state["part_attn"].detach().to(dtype=adapted.dtype)
+        tokens, _ = self.relation_encoder.visual_relations(adapted, attention)
+        return tokens
+
+    def _route(
+        self, scope: str, part_error: torch.Tensor,
+        relation_error: Optional[torch.Tensor], part_curvature: torch.Tensor,
+        relation_curvature: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        batch = part_error.size(0)
+        if scope == "adaptive":
+            if relation_error is None or relation_curvature is None:
+                raise RuntimeError("adaptive routing requires relation evidence")
+            return self.router(
+                part_error, relation_error, part_curvature, relation_curvature
+            )
+        route = part_error.new_zeros(batch, 3)
+        if scope == "part":
+            route[:, 1] = 1.0
+        elif scope == "relation":
+            route[:, 2] = 1.0
+        else:  # hybrid
+            route[:, 1:] = 0.5
+        return route, {
+            "route_skip": route[:, 0].mean().detach(),
+            "route_part": route[:, 1].mean().detach(),
+            "route_relation": route[:, 2].mean().detach(),
+            "route_entropy": route.new_zeros(()),
+        }
+
+    def meta_objective(
+        self, support: Dict[str, torch.Tensor], query: Dict[str, torch.Tensor],
+        inner_lr: float, q_mode: str = "uniform", kl_weight: float = 0.01,
+        scope: str = "adaptive", relation_weight: float = 1.0,
+        outer_task_fn: Optional[
+            Callable[[Dict[str, torch.Tensor], Dict[str, torch.Tensor], torch.Tensor], torch.Tensor]
+        ] = None,
+        task_weight: float = 1.0, semantic_weight: float = 0.1,
+        router_kl_weight: float = 0.001,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Joint one-step inner update with a task-feedback query evaluator.
+
+        Part/relation item policies and the granularity route influence only the
+        support update of the shared adapter.  The query task uses a stopped
+        reference distribution, so no learned weight multiplies its raw error.
+        """
+        self._check_scope(scope)
+        use_part = scope in ("part", "hybrid", "adaptive")
+        use_relation = scope in ("relation", "hybrid", "adaptive")
+        if use_relation and not self.enable_relations:
+            raise RuntimeError("relation meta scope requested but disabled")
+
+        support_tokens = support["part_tokens"].detach().float()
+        support_target = support["target_semantics"].detach().float()
+        support_curvature = support["curvature"].detach().float()
+        base_params = OrderedDict(self.adapter.named_parameters())
+        support_adapted = self.adapt_parts(support_tokens, base_params)
+        part_error = self._direct_alignment_error(support_adapted, support_target)
+
+        part_policy_stats: Dict[str, torch.Tensor] = {}
+        if use_part:
+            part_policy, part_policy_stats = self.policy(
+                support_tokens,
+                support["policy_semantics"].detach().float(),
+                support_curvature,
+            )
+            part_inner = (self.num_parts * part_policy * part_error).mean(dim=1)
+            part_kl = self._policy_kl(part_policy)
+        else:
+            part_inner = part_error.new_zeros(part_error.size(0))
+            part_kl = part_error.new_zeros(())
+
+        relation_error = None
+        relation_curvature = None
+        relation_policy_stats: Dict[str, torch.Tensor] = {}
+        if use_relation:
+            support_relation = support["relation_state"]
+            relation_tokens = self.relation_encoder.visual_relations(
+                support_adapted,
+                support_relation["part_attn"].detach().float(),
+            )[0]
+            relation_error = self.relation_alignment_error(
+                relation_tokens,
+                support_relation["target_semantics"].detach().float(),
+            )
+            relation_curvature = support_relation["curvature"].detach().float()
+            relation_policy, relation_policy_stats = self.relation_policy(
+                relation_tokens.detach(),
+                support_relation["policy_semantics"].detach().float(),
+                relation_curvature,
+            )
+            relation_inner = (
+                self.num_relations * relation_policy * relation_error
+            ).mean(dim=1)
+            relation_kl = self._policy_kl(relation_policy)
+        else:
+            relation_inner = part_inner.new_zeros(part_inner.shape)
+            relation_kl = part_error.new_zeros(())
+
+        route, route_stats = self._route(
+            scope, part_error, relation_error, support_curvature,
+            relation_curvature,
+        )
+        inner_loss = (
+            route[:, 1] * part_inner
+            + route[:, 2] * float(relation_weight) * relation_inner
+        ).mean()
         inner_grads = torch.autograd.grad(
             inner_loss, tuple(base_params.values()), create_graph=True,
             allow_unused=False,
@@ -531,172 +714,153 @@ class BilevelSemanticController(nn.Module):
             (name, param - float(inner_lr) * grad)
             for (name, param), grad in zip(base_params.items(), inner_grads)
         )
-        query_error_before = BilevelSemanticController._alignment_error(
-            adapter,
-            query_tokens,
-            query_target_sem,
-            base_params,
-            contrastive_weight=contrastive_weight,
-            temperature=temperature,
+
+        query_tokens = query["part_tokens"].detach().float()
+        query_target = query["target_semantics"].detach().float()
+        query_curvature = query["curvature"].detach().float()
+        part_before = self.alignment_error(query_tokens, query_target, base_params)
+        part_after = self.alignment_error(query_tokens, query_target, fast_params)
+        q_part = self.reference_distribution(part_after, query_curvature, q_mode)
+        part_outer = (q_part * part_after).sum(dim=1).mean()
+        part_before_value = (q_part * part_before.detach()).sum(dim=1).mean()
+
+        outer_align = part_outer.new_zeros(())
+        align_before = part_outer.new_zeros(())
+        normalizer = 0.0
+        if use_part:
+            outer_align = outer_align + part_outer
+            align_before = align_before + part_before_value
+            normalizer += 1.0
+        if use_relation:
+            query_relation = query["relation_state"]
+            relation_before_tokens = self._relation_tokens(query_relation, base_params)
+            relation_after_tokens = self._relation_tokens(query_relation, fast_params)
+            relation_before = self.relation_alignment_error(
+                relation_before_tokens,
+                query_relation["target_semantics"].detach().float(),
+            )
+            relation_after = self.relation_alignment_error(
+                relation_after_tokens,
+                query_relation["target_semantics"].detach().float(),
+            )
+            q_relation = self.reference_distribution(
+                relation_after,
+                query_relation["curvature"].detach().float(),
+                q_mode,
+            )
+            outer_align = outer_align + float(relation_weight) * (
+                q_relation * relation_after
+            ).sum(dim=1).mean()
+            align_before = align_before + float(relation_weight) * (
+                q_relation * relation_before.detach()
+            ).sum(dim=1).mean()
+            normalizer += float(relation_weight)
+        outer_align = outer_align / max(normalizer, 1.0)
+        align_before = align_before / max(normalizer, 1.0)
+
+        outer_task = outer_align.new_zeros(())
+        task_before = outer_align.new_zeros(())
+        if outer_task_fn is not None:
+            outer_task = outer_task_fn(query, fast_params, q_part)
+            with torch.no_grad():
+                task_before = outer_task_fn(query, base_params, q_part).detach()
+
+        router_kl = outer_align.new_zeros(())
+        if scope == "adaptive":
+            prior = self.router.prior.to(route)
+            router_kl = (
+                route * (route.clamp_min(1e-8).log() - prior.log())
+            ).sum(dim=1).mean()
+        meta_loss = (
+            float(task_weight) * outer_task
+            + float(semantic_weight) * outer_align
+            + float(kl_weight) * (part_kl + relation_kl)
+            + float(router_kl_weight) * router_kl
         )
-        query_error_after = BilevelSemanticController._alignment_error(
-            adapter,
-            query_tokens,
-            query_target_sem,
-            fast_params,
-            contrastive_weight=contrastive_weight,
-            temperature=temperature,
-        )
-        if q_mode == "uniform":
-            q = torch.full_like(query_error_after, 1.0 / num_items)
-        elif q_mode == "hvp":
-            q = query_curvature / query_curvature.sum(
-                dim=1, keepdim=True
-            ).clamp_min(1e-6)
-        else:
-            raise ValueError("meta q_mode must be 'uniform' or 'hvp'")
-        q = q.detach()
-        outer_align = (q * query_error_after).sum(dim=1).mean()
-        uniform = torch.full_like(p, 1.0 / num_items)
-        policy_kl = (
-            p * (p.clamp_min(1e-8).log() - uniform.log())
-        ).sum(dim=1).mean()
-        meta_loss = outer_align + float(kl_weight) * policy_kl
-        before = (q * query_error_before.detach()).sum(dim=1).mean()
-        stats = {
-            prefix + "meta_outer_align": outer_align.detach(),
-            prefix + "meta_inner_align": inner_loss.detach(),
-            prefix + "meta_improvement": before - outer_align.detach(),
-            prefix + "meta_policy_kl": policy_kl.detach(),
-            # Default logger prints four decimals, so also expose a scaled
-            # signal that makes small but meaningful improvements observable.
-            prefix + "meta_improvement_x1e4": (
-                (before - outer_align.detach()) * 1.0e4
-            ),
-            prefix + "target_std": query_target_sem.std().detach(),
-            prefix + "error_before": query_error_before.mean().detach(),
+        stats: Dict[str, torch.Tensor] = {
+            "meta_loss": meta_loss.detach(),
+            "meta_inner_align": inner_loss.detach(),
+            "meta_outer_task": outer_task.detach(),
+            "meta_task_improvement": task_before - outer_task.detach(),
+            "meta_task_improvement_x1e4": (
+                task_before - outer_task.detach()
+            ) * 1.0e4,
+            "meta_outer_align": outer_align.detach(),
+            "meta_improvement": align_before - outer_align.detach(),
+            "meta_policy_kl": (part_kl + relation_kl).detach(),
+            "meta_router_kl": router_kl.detach(),
         }
-        stats.update({prefix + key: value for key, value in policy_stats.items()})
+        stats.update(route_stats)
+        stats.update({"part_" + key: value for key, value in part_policy_stats.items()})
+        stats.update({"rel_" + key: value for key, value in relation_policy_stats.items()})
         return meta_loss, stats
 
-    @staticmethod
-    def _part_view(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        return {
-            "tokens": state["part_tokens"],
-            "policy_semantics": state["policy_semantics"],
-            "target_semantics": state["target_semantics"],
-            "curvature": state["curvature"],
-        }
-
-    @classmethod
-    def _check_scope(cls, scope: str) -> None:
-        if scope not in cls.VALID_SCOPES:
-            raise ValueError(f"meta scope must be one of {cls.VALID_SCOPES}")
-
-    def meta_objective(
-        self, support: Dict[str, torch.Tensor], query: Dict[str, torch.Tensor],
-        inner_lr: float, q_mode: str = "uniform", kl_weight: float = 0.01,
-        scope: str = "relation", relation_weight: float = 1.0,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Return an exact hypergradient for a one-step unrolled objective."""
-        self._check_scope(scope)
-        objectives = []
-        stats: Dict[str, torch.Tensor] = {}
-        if scope in ("part", "hybrid"):
-            part_loss, part_stats = self._single_meta_objective(
-                self._part_view(support), self._part_view(query), self.policy,
-                self.adapter, self.num_parts, inner_lr, q_mode, kl_weight,
-                "part_",
-            )
-            objectives.append(part_loss)
-            stats.update(part_stats)
-        if scope in ("relation", "hybrid"):
-            if not self.enable_relations:
-                raise RuntimeError("relation meta scope requested but disabled")
-            rel_loss, rel_stats = self._single_meta_objective(
-                support["relation_state"], query["relation_state"],
-                self.relation_policy, self.relation_adapter, self.num_relations,
-                inner_lr, q_mode, kl_weight, "rel_",
-                contrastive_weight=self.relation_contrastive_weight,
-                temperature=self.relation_temperature,
-            )
-            objectives.append(float(relation_weight) * rel_loss)
-            stats.update(rel_stats)
-        meta_loss = torch.stack(objectives).sum()
-        stats["meta_loss"] = meta_loss.detach()
-        return meta_loss, stats
-
-    @staticmethod
-    def _single_real_alignment(
-        state: Dict[str, torch.Tensor],
-        policy: CurvatureSemanticWeightPolicy,
-        adapter: LowRankSemanticAdapter,
-        num_items: int,
-        prefix: str,
-        contrastive_weight: float = 0.0,
-        temperature: float = 0.1,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        adapter_dtype = next(adapter.parameters()).dtype
-
-        visual_tokens = state["tokens"].to(dtype=adapter_dtype)
-        policy_semantics = state["policy_semantics"].to(dtype=adapter_dtype)
-        target_semantics = state["target_semantics"].to(dtype=adapter_dtype)
-        curvature = state["curvature"].to(dtype=adapter_dtype)
-
-        p, policy_stats = (
-            BilevelSemanticController._stopped_policy_distribution(
-                policy,
-                visual_tokens,
-                policy_semantics,
-                curvature,
-            )
-        )
-
-        error = BilevelSemanticController._alignment_error(
-            adapter,
-            visual_tokens,
-            target_semantics,
-            contrastive_weight=contrastive_weight,
-            temperature=temperature,
-        )
-
-        # p 必须 detach，禁止真实加权误差直接更新权重策略 phi。
-        loss = (num_items * p.detach() * error).mean()
-
-        stats = {
-            prefix + "real_align": loss.detach(),
-        }
-        stats.update({
-            prefix + key: value
-            for key, value in policy_stats.items()
-        })
-
-        return loss, stats
     def real_weighted_alignment(
-        self, state: Dict[str, torch.Tensor], scope: str = "relation",
+        self, state: Dict[str, torch.Tensor], scope: str = "adaptive",
         relation_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Real model loss; detached policies prevent a direct phi gradient."""
+        """Real shared-adapter loss with every learned policy detached."""
         self._check_scope(scope)
-        losses = []
-        stats: Dict[str, torch.Tensor] = {}
-        if scope in ("part", "hybrid"):
-            loss, item_stats = self._single_real_alignment(
-                self._part_view(state), self.policy, self.adapter,
-                self.num_parts, "part_meta_",
+        use_part = scope in ("part", "hybrid", "adaptive")
+        use_relation = scope in ("relation", "hybrid", "adaptive")
+        adapted = self.adapt_parts(state["part_tokens"])
+        part_error = self._direct_alignment_error(
+            adapted, state["target_semantics"]
+        )
+        if use_part:
+            part_policy, part_stats = self.policy_distribution(
+                state["part_tokens"], state["policy_semantics"],
+                state["curvature"],
             )
-            losses.append(loss)
-            stats.update(item_stats)
-        if scope in ("relation", "hybrid"):
-            loss, item_stats = self._single_real_alignment(
-                state["relation_state"], self.relation_policy,
-                self.relation_adapter, self.num_relations, "rel_meta_",
-                contrastive_weight=self.relation_contrastive_weight,
-                temperature=self.relation_temperature,
+            part_loss = (
+                self.num_parts * part_policy.detach() * part_error
+            ).mean(dim=1)
+        else:
+            part_loss = part_error.new_zeros(part_error.size(0))
+            part_stats = {}
+
+        relation_error = None
+        relation_curvature = None
+        if use_relation:
+            relation_state = state["relation_state"]
+            relation_tokens = self.relation_encoder.visual_relations(
+                adapted,
+                relation_state["part_attn"].to(dtype=adapted.dtype),
+            )[0]
+            relation_error = self.relation_alignment_error(
+                relation_tokens, relation_state["target_semantics"]
             )
-            losses.append(float(relation_weight) * loss)
-            stats.update(item_stats)
-        return torch.stack(losses).sum(), stats
+            relation_curvature = relation_state["curvature"]
+            relation_policy, relation_stats = self._stopped_policy_distribution(
+                self.relation_policy,
+                relation_tokens,
+                relation_state["policy_semantics"],
+                relation_curvature,
+            )
+            relation_loss = (
+                self.num_relations * relation_policy.detach() * relation_error
+            ).mean(dim=1)
+        else:
+            relation_loss = part_loss.new_zeros(part_loss.shape)
+            relation_stats = {}
+
+        route, route_stats = self._route(
+            scope, part_error.detach(),
+            relation_error.detach() if relation_error is not None else None,
+            state["curvature"].detach(),
+            relation_curvature.detach() if relation_curvature is not None else None,
+        )
+        loss = (
+            route[:, 1].detach() * part_loss
+            + route[:, 2].detach() * float(relation_weight) * relation_loss
+        ).mean()
+        stats: Dict[str, torch.Tensor] = {
+            "meta_real_align": loss.detach(),
+            **route_stats,
+        }
+        stats.update({"part_" + key: value for key, value in part_stats.items()})
+        stats.update({"rel_" + key: value for key, value in relation_stats.items()})
+        return loss, stats
 
     def policy_parameters(self, scope: str) -> Iterable[nn.Parameter]:
         """Return exactly the parameters owned by the requested meta policy."""
@@ -707,12 +871,20 @@ class BilevelSemanticController(nn.Module):
             if not self.enable_relations:
                 raise RuntimeError("relation meta scope requested but disabled")
             return self.relation_policy.parameters()
-        return tuple(self.policy.parameters()) + tuple(self.relation_policy.parameters())
+        parameters = tuple(self.policy.parameters()) + tuple(
+            self.relation_policy.parameters()
+        )
+        if scope == "adaptive":
+            parameters = parameters + tuple(self.router.parameters())
+        return parameters
 
     def all_policy_parameters(self) -> Iterable[nn.Parameter]:
         """All phi parameters, used to exclude policies from the main optimizer."""
         parameters = tuple(self.policy.parameters())
         if self.enable_relations:
-            parameters = parameters + tuple(self.relation_policy.parameters())
+            parameters = (
+                parameters
+                + tuple(self.relation_policy.parameters())
+                + tuple(self.router.parameters())
+            )
         return parameters
-

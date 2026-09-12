@@ -1,4 +1,4 @@
-"""CPU tests for V6 relation curvature and bilevel gradient invariants."""
+"""CPU tests for V7 adaptive-granularity bilevel invariants."""
 
 import unittest
 
@@ -105,7 +105,7 @@ class BilevelSemanticControllerTest(unittest.TestCase):
         real_loss.backward()
         self.assertFalse(any(param.grad is not None for param in policy_params))
         self.assertTrue(
-            any(p.grad is not None for p in self.controller.relation_adapter.parameters())
+            any(p.grad is not None for p in self.controller.adapter.parameters())
         )
 
     def test_relation_geometry_is_horizontal_flip_invariant(self):
@@ -135,6 +135,59 @@ class BilevelSemanticControllerTest(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(part_p.sum(1), torch.ones(self.batch)))
         self.assertTrue(torch.allclose(relation_p.sum(1), torch.ones(self.batch)))
+
+    def test_adaptive_router_receives_task_hypergradient(self):
+        support = self._state(6, compute_hvp=False)
+        query = self._state(7, compute_hvp=False)
+        target = torch.randn(self.batch, self.dim)
+
+        def outer_task_fn(state, params, reference):
+            adapted = self.controller.adapt_parts(
+                state["part_tokens"].detach().float(), params
+            )
+            pooled = (reference.unsqueeze(-1) * adapted).sum(dim=1)
+            return torch.nn.functional.mse_loss(pooled, target)
+
+        meta_loss, stats = self.controller.meta_objective(
+            support,
+            query,
+            inner_lr=0.1,
+            scope="adaptive",
+            outer_task_fn=outer_task_fn,
+            task_weight=1.0,
+            semantic_weight=0.0,
+            kl_weight=0.0,
+            router_kl_weight=0.0,
+        )
+        router_params = tuple(self.controller.router.parameters())
+        router_grads = torch.autograd.grad(meta_loss, router_params)
+        self.assertGreater(sum(g.abs().sum() for g in router_grads).item(), 0.0)
+        self.assertIn("route_skip", stats)
+        self.assertIn("meta_outer_task", stats)
+
+    def test_adaptive_real_loss_cannot_update_any_policy(self):
+        state = self._state(8, compute_hvp=False)
+        policy_params = tuple(self.controller.all_policy_parameters())
+        for parameter in self.controller.parameters():
+            parameter.grad = None
+        real_loss, _ = self.controller.real_weighted_alignment(
+            state, scope="adaptive"
+        )
+        real_loss.backward()
+        self.assertFalse(any(parameter.grad is not None for parameter in policy_params))
+        self.assertTrue(any(
+            parameter.grad is not None for parameter in self.controller.adapter.parameters()
+        ))
+
+    def test_relation_encoder_is_low_rank_and_semantic_target_is_frozen(self):
+        self.assertEqual(
+            self.controller.relation_encoder.relation_dim,
+            self.controller.relation_dim,
+        )
+        self.assertTrue(all(
+            not parameter.requires_grad
+            for parameter in self.controller.relation_encoder.semantic_encoder.parameters()
+        ))
 
 
 if __name__ == "__main__":
