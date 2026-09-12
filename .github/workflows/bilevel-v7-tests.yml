@@ -1,8 +1,10 @@
-name: Adaptive bilevel V7 tensor tests
+name: Counterfactual bilevel V8 tensor tests
 
 on:
   push:
-    branches: ["codex/adaptive-granularity-bilevel-v7"]
+    branches:
+      - "codex/adaptive-granularity-bilevel-v7"
+      - "codex/all-level-counterfactual-v8"
   pull_request:
 
 jobs:

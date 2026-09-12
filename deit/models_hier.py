@@ -127,13 +127,16 @@ class HierVisionTransformer(VisionTransformer):
                 policy_tau=meta_policy_tau,
                 reference_mix=meta_reference_mix,
                 diversity_weight=semantic_diversity_weight,
-                enable_relations=(meta_scope in ('relation', 'hybrid', 'adaptive')),
+                enable_relations=(meta_scope in (
+                    'relation', 'hybrid', 'adaptive', 'counterfactual'
+                )),
                 relation_hvp_samples=relation_hvp_samples,
                 relation_dim=relation_dim,
                 router_hidden_dim=router_hidden_dim,
                 router_prior=router_prior,
                 relation_contrastive_weight=relation_contrastive_weight,
                 relation_temperature=relation_temperature,
+                routing_scope=meta_scope,
             )
 
     def forward_features(self, x):
@@ -227,7 +230,9 @@ class HierVisionTransformer(VisionTransformer):
                 )
                 if (
                     should_build_relations
-                    and self.meta_scope in ('relation', 'hybrid', 'adaptive')
+                    and self.meta_scope in (
+                        'relation', 'hybrid', 'adaptive', 'counterfactual'
+                    )
                 ):
                     relation_compute_hvp = (
                         self.enable_relation_hvp
@@ -291,12 +296,28 @@ class HierVisionTransformer(VisionTransformer):
             family_out = self.family_head(intermediates[4][:, 0])
             return out, family_out
 
-    def bilevel_task_loss(
+    @staticmethod
+    def _distribution_js(left, right):
+        """Per-example Jensen-Shannon divergence between class distributions."""
+        left = left.clamp_min(1.0e-8)
+        right = right.clamp_min(1.0e-8)
+        middle = 0.5 * (left + right)
+        return 0.5 * (
+            (left * (left.log() - middle.log())).sum(dim=-1)
+            + (right * (right.log() - middle.log())).sum(dim=-1)
+        )
+
+    def bilevel_task_losses(
         self, state, adapter_params, reference, fine_targets, sub_targets,
-        basic_targets, leaf_index, sub_index, fine_weight=1.0,
-        family_weight=0.5, basic_weight=0.5,
+        basic_targets, leaf_index, sub_index, species_to_family=None,
+        species_to_order=None, consistency_weight=0.0,
     ):
-        """Fixed-reference hierarchical evaluator for the virtual update."""
+        """Per-example Species/Family/Order losses for V8 routing.
+
+        Returns a loss matrix and a label-availability mask, both shaped
+        ``(B, 3)``.  Keeping the losses unreduced lets each paired support/query
+        example receive its own task-specific counterfactual route.
+        """
         adapted = self.bilevel.adapt_parts(
             state['part_tokens'].detach().float(), adapter_params
         )
@@ -311,22 +332,99 @@ class HierVisionTransformer(VisionTransformer):
         basic_logits = self.manufacturer_head(
             state['basic_cls'].detach().float() + gate[2] * delta
         )
-        loss = fine_logits.new_zeros(())
-        if leaf_index.numel() > 0 and float(fine_weight) != 0.0:
-            loss = loss + float(fine_weight) * F.cross_entropy(
+
+        batch_size = fine_logits.size(0)
+        zero = fine_logits.new_zeros(batch_size)
+        fine_loss = zero
+        fine_mask = zero
+        if leaf_index.numel() > 0:
+            selected = F.cross_entropy(
                 fine_logits.index_select(0, leaf_index),
                 fine_targets.index_select(0, leaf_index),
+                reduction='none',
             )
-        if sub_index.numel() > 0 and float(family_weight) != 0.0:
-            loss = loss + float(family_weight) * F.cross_entropy(
+            fine_loss = fine_loss.index_copy(0, leaf_index, selected)
+            fine_mask = fine_mask.index_fill(0, leaf_index, 1.0)
+
+        family_loss = zero
+        family_mask = zero
+        if sub_index.numel() > 0:
+            selected = F.cross_entropy(
                 family_logits.index_select(0, sub_index),
                 sub_targets.index_select(0, sub_index),
+                reduction='none',
             )
-        if float(basic_weight) != 0.0:
-            loss = loss + float(basic_weight) * F.cross_entropy(
-                basic_logits, basic_targets
+            family_loss = family_loss.index_copy(0, sub_index, selected)
+            family_mask = family_mask.index_fill(0, sub_index, 1.0)
+
+        basic_loss = F.cross_entropy(
+            basic_logits, basic_targets, reduction='none'
+        )
+        basic_mask = torch.ones_like(basic_loss)
+
+        if float(consistency_weight) != 0.0:
+            if species_to_family is None or species_to_order is None:
+                raise RuntimeError(
+                    'hierarchy maps are required when meta consistency is enabled'
+                )
+            species_to_family = species_to_family.to(
+                device=fine_logits.device, dtype=fine_logits.dtype
             )
-        return loss
+            species_to_order = species_to_order.to(
+                device=fine_logits.device, dtype=fine_logits.dtype
+            )
+            if species_to_family.shape != (
+                fine_logits.size(1), family_logits.size(1)
+            ):
+                raise ValueError('invalid Species-to-Family hierarchy map')
+            if species_to_order.shape != (
+                fine_logits.size(1), basic_logits.size(1)
+            ):
+                raise ValueError('invalid Species-to-Order hierarchy map')
+
+            fine_prob = F.softmax(fine_logits, dim=-1)
+            implied_family = fine_prob @ species_to_family
+            implied_order = fine_prob @ species_to_order
+            family_consistency = self._distribution_js(
+                F.softmax(family_logits, dim=-1), implied_family
+            )
+            order_consistency = self._distribution_js(
+                F.softmax(basic_logits, dim=-1), implied_order
+            )
+
+            # Preserve the mean supervised-CE scale after extending the
+            # consistency evaluator to every example.  This uses only predicted
+            # distributions and the fixed taxonomy, never an unavailable label.
+            family_scale = float(batch_size) / family_mask.sum().clamp_min(1.0)
+            family_loss = (
+                family_scale * family_loss
+                + float(consistency_weight) * family_consistency
+            )
+            family_mask = torch.ones_like(family_mask)
+            basic_loss = (
+                basic_loss + float(consistency_weight) * order_consistency
+            )
+
+        return (
+            torch.stack((fine_loss, family_loss, basic_loss), dim=1),
+            torch.stack((fine_mask, family_mask, basic_mask), dim=1),
+        )
+
+    def bilevel_task_loss(
+        self, state, adapter_params, reference, fine_targets, sub_targets,
+        basic_targets, leaf_index, sub_index, fine_weight=1.0,
+        family_weight=0.5, basic_weight=0.5,
+    ):
+        """Backward-compatible reduced hierarchical virtual evaluator."""
+        losses, mask = self.bilevel_task_losses(
+            state, adapter_params, reference, fine_targets, sub_targets,
+            basic_targets, leaf_index, sub_index,
+        )
+        weights = losses.new_tensor((fine_weight, family_weight, basic_weight))
+        task_means = (
+            (losses * mask).sum(dim=0) / mask.sum(dim=0).clamp_min(1.0)
+        )
+        return (weights * task_means).sum()
 
     @torch.jit.ignore
     def no_weight_decay(self):

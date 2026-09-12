@@ -8,6 +8,11 @@ one-step support update by evaluating its effect on a separate query view.
 Policy parameters ``phi`` are isolated from ordinary task losses: policy inputs
 are stopped, and weights used by real losses and classification are detached.
 Only the post-update outer objective updates ``phi``.
+
+V8 adds a branch-counterfactual, all-level route.  Skip, part and relation
+updates are unrolled independently and evaluated on Species, Family and Order
+losses.  The router therefore receives nine identifiable decisions instead of
+one gradient through a pre-mixed update.
 """
 
 import math
@@ -157,14 +162,24 @@ class CurvatureSemanticWeightPolicy(nn.Module):
 
 
 class AdaptiveGranularityRouter(nn.Module):
-    """Meta-policy over skip, local-part and relation semantic updates."""
+    """Meta-policy over skip, local-part and relation semantic updates.
+
+    ``num_tasks=1`` preserves the V7 global router exactly.  ``num_tasks=3``
+    produces a task-by-branch matrix for fine/species, family and basic/order.
+    """
+
+    TASK_NAMES = ("species", "family", "order")
 
     def __init__(
         self,
         hidden_dim: int = 32,
         prior=(0.50, 0.45, 0.05),
+        num_tasks: int = 1,
     ):
         super().__init__()
+        if num_tasks not in (1, 3):
+            raise ValueError("granularity router num_tasks must be 1 or 3")
+        self.num_tasks = int(num_tasks)
         prior_tensor = torch.as_tensor(prior, dtype=torch.float32)
         if prior_tensor.numel() != 3 or (prior_tensor <= 0).any():
             raise ValueError("router prior must contain three positive values")
@@ -174,11 +189,11 @@ class AdaptiveGranularityRouter(nn.Module):
             nn.LayerNorm(8),
             nn.Linear(8, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 3),
+            nn.Linear(hidden_dim, 3 * self.num_tasks),
         )
         nn.init.zeros_(self.net[-1].weight)
         with torch.no_grad():
-            self.net[-1].bias.copy_(prior_tensor.log())
+            self.net[-1].bias.copy_(prior_tensor.log().repeat(self.num_tasks))
 
     def forward(
         self,
@@ -200,14 +215,35 @@ class AdaptiveGranularityRouter(nn.Module):
              pc_mean, pc_std, rc_mean, rc_std),
             dim=-1,
         )
-        route = torch.softmax(self.net(features), dim=-1)
+        logits = self.net(features)
+        if self.num_tasks == 1:
+            route = torch.softmax(logits, dim=-1)
+            entropy = -(route * route.clamp_min(1e-8).log()).sum(dim=-1)
+            return route, {
+                "route_skip": route[:, 0].mean().detach(),
+                "route_part": route[:, 1].mean().detach(),
+                "route_relation": route[:, 2].mean().detach(),
+                "route_entropy": entropy.mean().detach(),
+            }
+
+        route = torch.softmax(
+            logits.reshape(features.size(0), self.num_tasks, 3), dim=-1
+        )
         entropy = -(route * route.clamp_min(1e-8).log()).sum(dim=-1)
-        return route, {
-            "route_skip": route[:, 0].mean().detach(),
-            "route_part": route[:, 1].mean().detach(),
-            "route_relation": route[:, 2].mean().detach(),
+        stats = {
+            "route_skip": route[:, :, 0].mean().detach(),
+            "route_part": route[:, :, 1].mean().detach(),
+            "route_relation": route[:, :, 2].mean().detach(),
             "route_entropy": entropy.mean().detach(),
         }
+        for task_idx, task_name in enumerate(self.TASK_NAMES):
+            stats.update({
+                f"route_{task_name}_skip": route[:, task_idx, 0].mean().detach(),
+                f"route_{task_name}_part": route[:, task_idx, 1].mean().detach(),
+                f"route_{task_name}_relation": route[:, task_idx, 2].mean().detach(),
+                f"route_{task_name}_entropy": entropy[:, task_idx].mean().detach(),
+            })
+        return route, stats
 
 
 class PairwiseRelationEncoder(nn.Module):
@@ -314,7 +350,9 @@ class PairwiseRelationEncoder(nn.Module):
 class BilevelSemanticController(nn.Module):
     """Part- and relation-level one-step differentiable bilevel controller."""
 
-    VALID_SCOPES = ("part", "relation", "hybrid", "adaptive")
+    VALID_SCOPES = (
+        "part", "relation", "hybrid", "adaptive", "counterfactual"
+    )
 
     def __init__(
         self, dim: int, text_dim: int, num_parts: int, semantic_rank: int = 64,
@@ -327,6 +365,7 @@ class BilevelSemanticController(nn.Module):
         relation_dim: int = 64,
         router_hidden_dim: int = 32,
         router_prior=(0.50, 0.45, 0.05),
+        routing_scope: str = "adaptive",
     ):
         super().__init__()
         if relation_hvp_samples < 1:
@@ -342,6 +381,8 @@ class BilevelSemanticController(nn.Module):
         self.relation_contrastive_weight = float(relation_contrastive_weight)
         self.relation_temperature = float(relation_temperature)
         self.relation_dim = int(relation_dim)
+        self._check_scope(routing_scope)
+        self.routing_scope = routing_scope
         self.bridge = SemanticTokenBridge(dim, text_dim, num_parts, semantic_rank)
         self.adapter = LowRankSemanticAdapter(dim, adapter_rank)
         self.policy = CurvatureSemanticWeightPolicy(
@@ -355,7 +396,9 @@ class BilevelSemanticController(nn.Module):
                 self.relation_dim, policy_hidden_dim, policy_tau, reference_mix
             )
             self.router = AdaptiveGranularityRouter(
-                hidden_dim=router_hidden_dim, prior=router_prior
+                hidden_dim=router_hidden_dim,
+                prior=router_prior,
+                num_tasks=(3 if routing_scope == "counterfactual" else 1),
             )
 
     @property
@@ -629,6 +672,315 @@ class BilevelSemanticController(nn.Module):
             "route_entropy": route.new_zeros(()),
         }
 
+    @staticmethod
+    def _fast_params(
+        base_params: "OrderedDict[str, torch.Tensor]",
+        grads: Tuple[torch.Tensor, ...],
+        inner_lr: float,
+    ) -> "OrderedDict[str, torch.Tensor]":
+        return OrderedDict(
+            (name, param - float(inner_lr) * grad)
+            for (name, param), grad in zip(base_params.items(), grads)
+        )
+
+    @staticmethod
+    def _task_output(
+        value,
+        batch_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Validate an all-level outer evaluator result.
+
+        Counterfactual routing needs unreduced losses so the support/query pair
+        keeps its own route.  The expected format is ``(losses, mask)`` with
+        both tensors shaped ``(B, 3)`` in Species/Family/Order order.
+        """
+        if isinstance(value, dict):
+            losses = value.get("losses")
+            mask = value.get("mask")
+        elif isinstance(value, (tuple, list)) and len(value) == 2:
+            losses, mask = value
+        else:
+            raise TypeError(
+                "counterfactual outer_task_fn must return (losses, mask) "
+                "with shape (B, 3)"
+            )
+        if not isinstance(losses, torch.Tensor) or not isinstance(mask, torch.Tensor):
+            raise TypeError("counterfactual task losses and mask must be tensors")
+        if tuple(losses.shape) != (batch_size, 3):
+            raise ValueError(
+                "counterfactual task losses must have shape "
+                f"({batch_size}, 3), got {tuple(losses.shape)}"
+            )
+        if tuple(mask.shape) != tuple(losses.shape):
+            raise ValueError("counterfactual task mask must match task losses")
+        return losses.float(), mask.to(device=losses.device, dtype=losses.dtype)
+
+    def _counterfactual_alignment(
+        self,
+        query: Dict[str, torch.Tensor],
+        params: Dict[str, torch.Tensor],
+        q_part: torch.Tensor,
+        q_relation: torch.Tensor,
+        relation_weight: float,
+    ) -> torch.Tensor:
+        """Per-example fixed-reference semantic loss for one virtual branch."""
+        query_tokens = query["part_tokens"].detach().float()
+        query_target = query["target_semantics"].detach().float()
+        part_error = self.alignment_error(query_tokens, query_target, params)
+        part_loss = (q_part * part_error).sum(dim=1)
+
+        query_relation = query["relation_state"]
+        relation_tokens = self._relation_tokens(query_relation, params)
+        relation_error = self.relation_alignment_error(
+            relation_tokens,
+            query_relation["target_semantics"].detach().float(),
+        )
+        relation_loss = (q_relation * relation_error).sum(dim=1)
+        normalizer = 1.0 + float(relation_weight)
+        return (
+            part_loss + float(relation_weight) * relation_loss
+        ) / max(normalizer, 1.0)
+
+    def _counterfactual_meta_objective(
+        self,
+        support: Dict[str, torch.Tensor],
+        query: Dict[str, torch.Tensor],
+        inner_lr: float,
+        q_mode: str,
+        kl_weight: float,
+        relation_weight: float,
+        outer_task_fn: Callable,
+        task_weight: float,
+        semantic_weight: float,
+        router_kl_weight: float,
+        task_level_weights: Tuple[float, float, float],
+        router_advantage_scale: float,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Three virtual branches evaluated independently at all three levels."""
+        if not self.enable_relations:
+            raise RuntimeError("counterfactual routing requires relation evidence")
+        if self.router.num_tasks != 3:
+            raise RuntimeError(
+                "controller was not constructed with routing_scope='counterfactual'"
+            )
+        if outer_task_fn is None:
+            raise RuntimeError("counterfactual routing requires an outer task evaluator")
+        if router_advantage_scale < 0:
+            raise ValueError("router_advantage_scale must be nonnegative")
+
+        level_weights = torch.as_tensor(
+            task_level_weights, dtype=torch.float32,
+            device=support["part_tokens"].device,
+        )
+        if level_weights.numel() != 3 or (level_weights < 0).any():
+            raise ValueError("task_level_weights must contain three nonnegative values")
+        if float(level_weights.sum()) <= 0:
+            raise ValueError("at least one task-level weight must be positive")
+
+        support_tokens = support["part_tokens"].detach().float()
+        support_target = support["target_semantics"].detach().float()
+        support_curvature = support["curvature"].detach().float()
+        base_params = OrderedDict(self.adapter.named_parameters())
+        support_adapted = self.adapt_parts(support_tokens, base_params)
+
+        part_error = self._direct_alignment_error(support_adapted, support_target)
+        part_policy, part_policy_stats = self.policy(
+            support_tokens,
+            support["policy_semantics"].detach().float(),
+            support_curvature,
+        )
+        part_inner_per_example = (
+            self.num_parts * part_policy * part_error
+        ).mean(dim=1)
+        part_kl = self._policy_kl(part_policy)
+
+        support_relation = support["relation_state"]
+        relation_tokens = self.relation_encoder.visual_relations(
+            support_adapted,
+            support_relation["part_attn"].detach().float(),
+        )[0]
+        relation_error = self.relation_alignment_error(
+            relation_tokens,
+            support_relation["target_semantics"].detach().float(),
+        )
+        relation_curvature = support_relation["curvature"].detach().float()
+        relation_policy, relation_policy_stats = self.relation_policy(
+            relation_tokens.detach(),
+            support_relation["policy_semantics"].detach().float(),
+            relation_curvature,
+        )
+        relation_inner_per_example = (
+            self.num_relations * relation_policy * relation_error
+        ).mean(dim=1)
+        relation_kl = self._policy_kl(relation_policy)
+
+        # Each update is unrolled separately.  No route probability is allowed
+        # to mix the inner losses before their causal effect is observed.
+        base_values = tuple(base_params.values())
+        part_grads = torch.autograd.grad(
+            part_inner_per_example.mean(), base_values,
+            create_graph=True, retain_graph=True, allow_unused=False,
+        )
+        relation_grads = torch.autograd.grad(
+            float(relation_weight) * relation_inner_per_example.mean(),
+            base_values, create_graph=True, allow_unused=False,
+        )
+        branch_params = (
+            base_params,
+            self._fast_params(base_params, part_grads, inner_lr),
+            self._fast_params(base_params, relation_grads, inner_lr),
+        )
+
+        route, route_stats = self.router(
+            part_error,
+            relation_error,
+            support_curvature,
+            relation_curvature,
+        )
+
+        # A single stopped reference is shared by all branches; otherwise a
+        # branch could look better merely by changing how it is evaluated.
+        query_tokens = query["part_tokens"].detach().float()
+        query_target = query["target_semantics"].detach().float()
+        query_part_base = self.alignment_error(
+            query_tokens, query_target, base_params
+        )
+        q_part = self.reference_distribution(
+            query_part_base, query["curvature"].detach().float(), q_mode
+        )
+        query_relation = query["relation_state"]
+        query_relation_base_tokens = self._relation_tokens(
+            query_relation, base_params
+        )
+        query_relation_base = self.relation_alignment_error(
+            query_relation_base_tokens,
+            query_relation["target_semantics"].detach().float(),
+        )
+        q_relation = self.reference_distribution(
+            query_relation_base,
+            query_relation["curvature"].detach().float(),
+            q_mode,
+        )
+
+        task_branches = []
+        align_branches = []
+        task_mask = None
+        batch_size = support_tokens.size(0)
+        for params in branch_params:
+            task_losses, branch_mask = self._task_output(
+                outer_task_fn(query, params, q_part), batch_size
+            )
+            if task_mask is None:
+                task_mask = branch_mask
+            elif not torch.equal(task_mask.bool(), branch_mask.bool()):
+                raise ValueError("all counterfactual branches must use the same task mask")
+            task_branches.append(task_losses)
+            align_branches.append(self._counterfactual_alignment(
+                query, params, q_part, q_relation, relation_weight
+            ))
+
+        # (B, task, branch), with branch order skip/part/relation.
+        branch_task_loss = torch.stack(task_branches, dim=-1)
+        branch_align_loss = torch.stack(align_branches, dim=-1)
+        weighted_mask = task_mask * level_weights.view(1, 3)
+
+        def weighted_task_reduce(value: torch.Tensor) -> torch.Tensor:
+            task_means = (
+                (value * task_mask).sum(dim=0)
+                / task_mask.sum(dim=0).clamp_min(1.0)
+            )
+            return (level_weights * task_means).sum()
+
+        expected_task_per_level = (route * branch_task_loss).sum(dim=-1)
+        outer_task = weighted_task_reduce(expected_task_per_level)
+        task_before = weighted_task_reduce(branch_task_loss[:, :, 0])
+
+        # Normalized counterfactual regret strengthens only between-branch
+        # evidence.  The skip baseline is common to all routes and contributes
+        # no artificial preference.
+        skip_task = branch_task_loss[:, :, 0].detach()
+        relative_regret = (
+            branch_task_loss - skip_task.unsqueeze(-1)
+        ) / skip_task.abs().unsqueeze(-1).clamp_min(1.0e-3)
+        relative_regret = relative_regret.clamp(min=-10.0, max=10.0)
+        expected_regret = (route * relative_regret).sum(dim=-1)
+        router_objective = weighted_task_reduce(expected_regret)
+
+        # Convert task-specific routes into one per-example semantic route only
+        # for the auxiliary alignment evaluator.  Classification routing remains
+        # fully task-specific above.
+        route_weight = weighted_mask / weighted_mask.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1.0)
+        semantic_route = (route_weight.unsqueeze(-1) * route).sum(dim=1)
+        outer_align = (semantic_route * branch_align_loss).sum(dim=-1).mean()
+        align_before = branch_align_loss[:, 0].mean()
+
+        prior = self.router.prior.to(route)
+        router_kl = (
+            route * (route.clamp_min(1e-8).log() - prior.log())
+        ).sum(dim=-1).mean()
+        meta_loss = (
+            float(task_weight) * (
+                outer_task + float(router_advantage_scale) * router_objective
+            )
+            + float(semantic_weight) * outer_align
+            + float(kl_weight) * (part_kl + relation_kl)
+            + float(router_kl_weight) * router_kl
+        )
+
+        def masked_level_mean(value: torch.Tensor, task_idx: int) -> torch.Tensor:
+            mask = task_mask[:, task_idx]
+            return (value[:, task_idx] * mask).sum() / mask.sum().clamp_min(1.0)
+
+        stats: Dict[str, torch.Tensor] = {
+            "meta_loss": meta_loss.detach(),
+            "meta_inner_align": (
+                0.5 * (
+                    part_inner_per_example.mean()
+                    + float(relation_weight) * relation_inner_per_example.mean()
+                )
+            ).detach(),
+            "meta_outer_task": outer_task.detach(),
+            "meta_task_improvement": (task_before - outer_task).detach(),
+            "meta_task_improvement_x1e4": (
+                task_before - outer_task
+            ).detach() * 1.0e4,
+            "meta_router_objective": router_objective.detach(),
+            "meta_outer_align": outer_align.detach(),
+            "meta_improvement": (align_before - outer_align).detach(),
+            "meta_policy_kl": (part_kl + relation_kl).detach(),
+            "meta_router_kl": router_kl.detach(),
+        }
+        task_names = AdaptiveGranularityRouter.TASK_NAMES
+        for task_idx, task_name in enumerate(task_names):
+            skip_value = masked_level_mean(branch_task_loss[:, :, 0], task_idx)
+            part_value = masked_level_mean(branch_task_loss[:, :, 1], task_idx)
+            relation_value = masked_level_mean(branch_task_loss[:, :, 2], task_idx)
+            stats.update({
+                f"meta_{task_name}_skip_task": skip_value.detach(),
+                f"meta_{task_name}_part_task": part_value.detach(),
+                f"meta_{task_name}_relation_task": relation_value.detach(),
+                f"meta_{task_name}_part_improvement": (
+                    skip_value - part_value
+                ).detach(),
+                f"meta_{task_name}_relation_improvement": (
+                    skip_value - relation_value
+                ).detach(),
+            })
+        part_task = weighted_task_reduce(branch_task_loss[:, :, 1])
+        relation_task = weighted_task_reduce(branch_task_loss[:, :, 2])
+        stats.update({
+            "meta_part_task_improvement": (task_before - part_task).detach(),
+            "meta_relation_task_improvement": (
+                task_before - relation_task
+            ).detach(),
+        })
+        stats.update(route_stats)
+        stats.update({"part_" + key: value for key, value in part_policy_stats.items()})
+        stats.update({"rel_" + key: value for key, value in relation_policy_stats.items()})
+        return meta_loss, stats
+
     def meta_objective(
         self, support: Dict[str, torch.Tensor], query: Dict[str, torch.Tensor],
         inner_lr: float, q_mode: str = "uniform", kl_weight: float = 0.01,
@@ -638,6 +990,8 @@ class BilevelSemanticController(nn.Module):
         ] = None,
         task_weight: float = 1.0, semantic_weight: float = 0.1,
         router_kl_weight: float = 0.001,
+        task_level_weights: Tuple[float, float, float] = (1.0, 0.5, 0.5),
+        router_advantage_scale: float = 100.0,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Joint one-step inner update with a task-feedback query evaluator.
 
@@ -646,6 +1000,21 @@ class BilevelSemanticController(nn.Module):
         reference distribution, so no learned weight multiplies its raw error.
         """
         self._check_scope(scope)
+        if scope == "counterfactual":
+            return self._counterfactual_meta_objective(
+                support=support,
+                query=query,
+                inner_lr=inner_lr,
+                q_mode=q_mode,
+                kl_weight=kl_weight,
+                relation_weight=relation_weight,
+                outer_task_fn=outer_task_fn,
+                task_weight=task_weight,
+                semantic_weight=semantic_weight,
+                router_kl_weight=router_kl_weight,
+                task_level_weights=task_level_weights,
+                router_advantage_scale=router_advantage_scale,
+            )
         use_part = scope in ("part", "hybrid", "adaptive")
         use_relation = scope in ("relation", "hybrid", "adaptive")
         if use_relation and not self.enable_relations:
@@ -798,11 +1167,14 @@ class BilevelSemanticController(nn.Module):
     def real_weighted_alignment(
         self, state: Dict[str, torch.Tensor], scope: str = "adaptive",
         relation_weight: float = 1.0,
+        task_level_weights: Tuple[float, float, float] = (1.0, 0.5, 0.5),
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Real shared-adapter loss with every learned policy detached."""
         self._check_scope(scope)
-        use_part = scope in ("part", "hybrid", "adaptive")
-        use_relation = scope in ("relation", "hybrid", "adaptive")
+        use_part = scope in ("part", "hybrid", "adaptive", "counterfactual")
+        use_relation = scope in (
+            "relation", "hybrid", "adaptive", "counterfactual"
+        )
         adapted = self.adapt_parts(state["part_tokens"])
         part_error = self._direct_alignment_error(
             adapted, state["target_semantics"]
@@ -844,12 +1216,34 @@ class BilevelSemanticController(nn.Module):
             relation_loss = part_loss.new_zeros(part_loss.shape)
             relation_stats = {}
 
-        route, route_stats = self._route(
-            scope, part_error.detach(),
-            relation_error.detach() if relation_error is not None else None,
-            state["curvature"].detach(),
-            relation_curvature.detach() if relation_curvature is not None else None,
-        )
+        if scope == "counterfactual":
+            if self.router.num_tasks != 3:
+                raise RuntimeError(
+                    "controller was not constructed with "
+                    "routing_scope='counterfactual'"
+                )
+            task_route, route_stats = self.router(
+                part_error.detach(), relation_error.detach(),
+                state["curvature"].detach(), relation_curvature.detach(),
+            )
+            level_weights = torch.as_tensor(
+                task_level_weights, device=task_route.device,
+                dtype=task_route.dtype,
+            )
+            if level_weights.numel() != 3 or (level_weights < 0).any():
+                raise ValueError(
+                    "task_level_weights must contain three nonnegative values"
+                )
+            route = (
+                task_route * level_weights.view(1, 3, 1)
+            ).sum(dim=1) / level_weights.sum().clamp_min(1.0e-8)
+        else:
+            route, route_stats = self._route(
+                scope, part_error.detach(),
+                relation_error.detach() if relation_error is not None else None,
+                state["curvature"].detach(),
+                relation_curvature.detach() if relation_curvature is not None else None,
+            )
         loss = (
             route[:, 1].detach() * part_loss
             + route[:, 2].detach() * float(relation_weight) * relation_loss
@@ -874,7 +1268,7 @@ class BilevelSemanticController(nn.Module):
         parameters = tuple(self.policy.parameters()) + tuple(
             self.relation_policy.parameters()
         )
-        if scope == "adaptive":
+        if scope in ("adaptive", "counterfactual"):
             parameters = parameters + tuple(self.router.parameters())
         return parameters
 

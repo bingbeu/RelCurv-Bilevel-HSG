@@ -1,22 +1,24 @@
-# RelCurv-Bilevel-HSG V7
+# RelCurv-Bilevel-HSG V8
 
 **Task-Feedback Adaptive-Granularity Curvature-Aware Semantic Grounding for
 Free-Grained Hierarchical Recognition**
 
-V7 replaces fixed relation fusion with a meta-learned update route. The policy
-chooses `skip`, local-part alignment or relation alignment on a support view.
-It performs one differentiable virtual update of a shared low-rank semantic
-adapter; an independent query view then judges the updated adapter with the
-hierarchical recognition loss and a fixed-reference semantic evaluator.
+V8 unrolls `skip`, local-part alignment and relation alignment as three separate
+virtual updates.  A paired query view evaluates every branch independently on
+Species, Family and Order.  The router learns a per-example `3 x 3` decision
+matrix, so every semantic granularity may help every hierarchy level when its
+counterfactual task feedback is positive.
 
-## Why V7
+## Why V8
 
 - The virtual adapter is part of the real inference path, so meta improvement
   can affect downstream predictions.
 - Part and relation alignment update the **same** adapter.
 - Relation descriptors are not concatenated into the classifier.
-- A learned granularity router can reject noisy relation updates on CUB and
-  retain them only when query task feedback supports them.
+- The router no longer sees only one pre-mixed post-update scalar; it receives
+  identifiable skip/part/relation outcomes for each hierarchy level.
+- A fixed-taxonomy Jensen-Shannon term is a differentiable TICE surrogate and
+  uses no unavailable training label.
 - The relation embedding is low-rank (`384 -> 64` by default), avoiding the
   previous approximately one-million-parameter relation branch.
 - Policy and router parameters are updated only by the outer hypergradient;
@@ -57,7 +59,7 @@ CUDA_VISIBLE_DEVICES=3 python deit/main_hier_partial.py \
   --texts captions/air_caps.txt \
   --sim_loss_weight 1 --sp_proportion 0.3 --fm_proportion 0.6 \
   --finetune /path/deit_small_patch16_224-cd65a155.pth \
-  --enable-bilevel --meta-scope adaptive --num-parts 8 \
+  --enable-bilevel --meta-scope counterfactual --num-parts 8 \
   --lam-cls 0.0 --lam-attr 1.0 --proto-align-weight 0.0 \
   --meta-start-epoch 5 --meta-inner-lr 0.1 \
   --meta-lr 1e-4 --meta-weight-decay 1e-4 \
@@ -65,6 +67,8 @@ CUDA_VISIBLE_DEVICES=3 python deit/main_hier_partial.py \
   --meta-reference-mix 0.5 --meta-q uniform \
   --meta-task-weight 1.0 --meta-semantic-weight 0.1 \
   --meta-router-kl-weight 0.001 \
+  --meta-router-advantage-scale 100 \
+  --meta-consistency-weight 0.1 \
   --relation-dim 64 --relation-hvp-samples 1 \
   --relation-contrastive-weight 0.1 --relation-temperature 0.1 \
   --router-prior 0.50 0.45 0.05
@@ -75,7 +79,7 @@ GPU. Use a new output directory.
 
 ## CUB
 
-Use the same adaptive method with the official CUB proportions and paths:
+Use the same counterfactual method with the official CUB proportions and paths:
 
 ```bash
 CUDA_VISIBLE_DEVICES=3 python deit/main_hier_partial.py \
@@ -88,20 +92,22 @@ CUDA_VISIBLE_DEVICES=3 python deit/main_hier_partial.py \
   --texts captions/cub_caps.txt --sim_loss_weight 1 \
   --sp_proportion 0.1 --fm_proportion 0.5 \
   --finetune /path/deit_small_patch16_224-cd65a155.pth \
-  --enable-bilevel --meta-scope adaptive --num-parts 8 \
+  --enable-bilevel --meta-scope counterfactual --num-parts 8 \
   --meta-start-epoch 5 --meta-inner-lr 0.1 --meta-lr 1e-4 \
   --meta-real-weight 0.1 --meta-q uniform \
   --meta-task-weight 1.0 --meta-semantic-weight 0.1 \
+  --meta-router-advantage-scale 100 --meta-consistency-weight 0.1 \
   --relation-dim 64 --relation-hvp-samples 1 \
   --router-prior 0.50 0.45 0.05
 ```
 
 ## Checkpoint migration
 
-V7 changes the relation encoder shape, removes the standalone relation adapter
-and adds a router. Do **not** resume a V6 optimizer state. Start from the same
-E2 or ImageNet checkpoint with `--finetune`; use `--resume` only for a V7
-checkpoint from the same configuration.
+The V8 counterfactual router has nine logits instead of the V7 router's three.
+Do **not** resume a V7 optimizer/model state into `--meta-scope counterfactual`.
+Start from the same E2 or ImageNet checkpoint with `--finetune`; use `--resume`
+only for a V8 checkpoint from the same configuration.  The old `adaptive` scope
+is retained so existing V7 checkpoints remain loadable.
 
 ## Verification and logging
 
@@ -110,11 +116,11 @@ python -m compileall -q deit
 PYTHONPATH=deit python -m unittest -v deit/test_semantic_bilevel.py
 ```
 
-Training logs expose `route_skip`, `route_part`, `route_relation`,
-`meta_outer_task`, `meta_task_improvement`, policy entropy and
-`meta_policy_grad_norm`. Report at least three paired seeds and select epochs on
-a held-out validation set rather than the test set.
+Training logs expose aggregate routes plus `route_species_*`, `route_family_*`,
+`route_order_*`, every branch's per-level improvement,
+`meta_part_task_improvement`, `meta_relation_task_improvement`, policy entropy
+and `meta_policy_grad_norm`. Report at least three paired seeds and select
+epochs on a held-out validation set rather than the test set.
 
 This repository derives from the official implementation of *Free-Grained
 Hierarchical Visual Recognition*. Retain the upstream license and attribution.
-

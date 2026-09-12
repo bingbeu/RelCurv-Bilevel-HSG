@@ -3,6 +3,7 @@
 """Free-grain datasets. Used to build the training set for every method."""
 import os
 import json
+import torch
 
 from torchvision import datasets, transforms
 from torchvision.datasets.folder import ImageFolder, default_loader
@@ -199,6 +200,28 @@ def build_dataset(is_train, args):
         )
         nb_classes = [10000, 1103, 273]
 
+
+    # Fixed taxonomy maps for the differentiable TICE surrogate.  They contain
+    # no sample labels and therefore do not reveal the held-out fine/family
+    # annotations used by the free-grained protocol.
+    hierarchy_rows = None
+    family_column = None
+    order_column = None
+    if args.data_set.startswith('AIR-HIER'):
+        hierarchy_rows = aircraft_partial.trees
+        family_column, order_column = 1, 2
+    elif args.data_set.startswith('BIRD-HIER'):
+        hierarchy_rows = birds_partial.trees
+        family_column, order_column = 2, 1
+    if hierarchy_rows is not None:
+        species_to_family = torch.zeros(nb_classes[0], nb_classes[1])
+        species_to_order = torch.zeros(nb_classes[0], nb_classes[2])
+        for row in hierarchy_rows:
+            species = int(row[0]) - 1
+            species_to_family[species, int(row[family_column]) - 1] = 1.0
+            species_to_order[species, int(row[order_column]) - 1] = 1.0
+        dataset.species_to_family = species_to_family
+        dataset.species_to_order = species_to_order
 
     return dataset, nb_classes
 

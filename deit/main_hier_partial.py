@@ -230,12 +230,20 @@ def get_args_parser():
                         help='warm up semantic tokens before enabling the meta step')
     parser.add_argument('--meta-q', default='uniform', choices=['uniform', 'hvp'])
     parser.add_argument('--meta-scope', default='adaptive',
-                        choices=['part', 'relation', 'hybrid', 'adaptive'],
-                        help='adaptive learns skip/local/relation routing from query task feedback')
+                        choices=['part', 'relation', 'hybrid', 'adaptive',
+                                 'counterfactual'],
+                        help=('counterfactual independently evaluates skip/local/relation '
+                              'updates for Species, Family and Order'))
     parser.add_argument('--meta-relation-weight', default=1.0, type=float)
     parser.add_argument('--meta-task-weight', default=1.0, type=float)
     parser.add_argument('--meta-semantic-weight', default=0.1, type=float)
     parser.add_argument('--meta-router-kl-weight', default=0.001, type=float)
+    parser.add_argument('--meta-router-advantage-scale', default=100.0, type=float,
+                        help=('scale normalized post-update branch regret in the '
+                              'counterfactual outer objective'))
+    parser.add_argument('--meta-consistency-weight', default=0.1, type=float,
+                        help=('Jensen-Shannon hierarchy consistency weight used '
+                              'by the counterfactual query evaluator'))
     parser.add_argument('--meta-fine-weight', default=1.0, type=float)
     parser.add_argument('--meta-family-weight', default=0.5, type=float)
     parser.add_argument('--meta-basic-weight', default=0.5, type=float)
@@ -274,9 +282,9 @@ def main(args):
         and not args.allow_random_init
     ):
         raise ValueError(
-            "Bilevel fine-grained training requires ImageNet initialization. "
+            "Bilevel hierarchical training requires ImageNet initialization. "
             "Pass --finetune /path/to/deit_small_patch16_224-cd65a155.pth, "
-            "--resume a compatible V7 checkpoint, or explicitly acknowledge "
+            "--resume a compatible checkpoint, or explicitly acknowledge "
             "an ablation with --allow-random-init."
         )
 

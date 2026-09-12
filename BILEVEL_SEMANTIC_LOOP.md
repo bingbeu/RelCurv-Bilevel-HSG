@@ -1,33 +1,43 @@
-# Adaptive-Granularity Task-Feedback Bilevel Optimization
+# All-Level Counterfactual Task-Feedback Bilevel Optimization (V8)
 
 Let `theta` denote the backbone and classifier, `psi` the shared semantic
 adapter, and `phi` the token policies plus granularity router.
 
 For a support view, local and relation policies produce `p_part` and `p_rel`.
-The router produces:
+V8 does not mix their losses before the virtual update.  It constructs three
+counterfactual adapter states:
 
 ```text
-[g_skip, g_part, g_rel] = Router_phi(stopped error/curvature statistics)
+psi_skip = psi
+psi_part = psi - inner_lr * grad_psi L_part
+psi_rel  = psi - inner_lr * grad_psi L_relation
 ```
 
-The lower-level update is
+Each state is evaluated on the paired query view for Species, Family and Order:
 
 ```text
-L_inner = g_part * sum_i P * p_part[i] * e_part[i]
-        + g_rel  * sum_m R * p_rel[m] * e_rel[m]
-
-psi+ = psi - inner_lr * grad_psi L_inner
+J[t,b] = hierarchy_task_t(query; psi_b)
+t in {species, family, order}
+b in {skip, part, relation}
 ```
 
-Both branches update the same `psi`. Relation tokens are recomputed from
-adapted part tokens, so relation-guided updates are evaluated through the
-ordinary part-based classifier rather than an extra relation classifier.
-
-The upper-level objective is
+The router produces a per-example `3 x 3` matrix rather than one global vector:
 
 ```text
-L_outer = task_weight * L_hier(query; psi+, q_part)
-        + semantic_weight * L_sem_ref(query; psi+, q_part, q_rel)
+R_phi[x,t,b] = P(branch=b | example=x, hierarchy-level=t)
+```
+
+This keeps all branches available to all hierarchy levels.  Relation curvature
+is not hard-coded as coarse-only, and part curvature is not hard-coded as
+fine-only.
+
+The upper-level task objective is the expected counterfactual query loss plus
+a normalized regret term relative to `skip`:
+
+```text
+L_outer = task_weight * sum_x,t,b w_t M[x,t] R[x,t,b] J[x,t,b]
+        + advantage_scale * normalized_regret(J[b] - J[skip])
+        + semantic_weight * L_sem_ref(query; psi_b, q_part, q_rel)
         + kl_weight * item_policy_regularization
         + router_kl_weight * router_prior_regularization
 ```
@@ -35,16 +45,29 @@ L_outer = task_weight * L_hier(query; psi+, q_part)
 `q_part` and `q_rel` are uniform or stopped HVP distributions. Neither learned
 item weights nor learned route weights multiply the raw query loss. Thus the
 policy is rewarded for selecting an update that improves post-update query
-performance, not for selecting items with an already small error.
+performance, not for selecting items with an already small error.  The mask
+`M` follows the official free-grained label protocol.
+
+## FPA and TICE surrogates
+
+The weighted Species/Family/Order query losses form a differentiable surrogate
+for full-path accuracy: all three levels must improve for their joint loss to
+fall.  For CUB and Aircraft, the fixed taxonomy additionally projects the
+Species distribution to implied Family and Order distributions.  Jensen-Shannon
+consistency with the two classifier distributions is added with
+`--meta-consistency-weight`.  This uses predictions and the public class tree,
+never an unavailable fine label.
 
 ## Strict separation
 
-- `create_graph=True` retains the hypergradient through the virtual update.
+- `create_graph=True` retains the hypergradient through both independent
+  non-skip virtual updates.
 - `phi` is excluded from the main optimizer.
 - The meta optimizer contains only the policies/router selected by
   `--meta-scope`.
 - Real alignment uses detached `p_part`, `p_rel` and route probabilities.
-- The outer query backbone is stopped; only functional `psi+` is differentiated.
+- The outer query backbone is stopped; only functional counterfactual adapters
+  are differentiated.
 - The semantic relation target encoder is frozen.
 
 This is a differentiable one-step truncated solver of a bilevel objective, not
@@ -68,9 +91,11 @@ is computed in FP32 and stopped before entering the policy.
 1. E2 without bilevel optimization.
 2. Part-only V7 (`--meta-scope part`).
 3. Fixed hybrid (`--meta-scope hybrid`).
-4. Adaptive routing (`--meta-scope adaptive`).
-5. Adaptive routing without relation HVP (`--no-relation-hvp`).
-6. Uniform item policies (`--meta-reference-mix 0`).
-7. Task-free outer objective (`--meta-task-weight 0`) as a diagnostic only.
+4. V7 pre-mixed routing (`--meta-scope adaptive`).
+5. V8 all-level counterfactual routing (`--meta-scope counterfactual`).
+6. V8 without the consistency surrogate (`--meta-consistency-weight 0`).
+7. V8 without relation HVP (`--no-relation-hvp`).
+8. Uniform item policies (`--meta-reference-mix 0`).
+9. Task-free outer objective (`--meta-task-weight 0`) as a diagnostic only.
 
 Use identical initialization, schedules and paired seeds for every comparison.

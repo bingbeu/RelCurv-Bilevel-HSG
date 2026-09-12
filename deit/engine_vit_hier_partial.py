@@ -41,6 +41,15 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
     if z_family is not None:
         z_family = z_family.to(device)
         z_order = z_order.to(device)
+    species_to_family = getattr(
+        data_loader.dataset, 'species_to_family', None
+    )
+    species_to_order = getattr(
+        data_loader.dataset, 'species_to_order', None
+    )
+    if species_to_family is not None:
+        species_to_family = species_to_family.to(device)
+        species_to_order = species_to_order.to(device)
 
 
     for data in metric_logger.log_every(data_loader, print_freq, header):
@@ -173,6 +182,20 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             # Meta step: exact hypergradient of the one-step unrolled objective.
             # Only phi (the policy) is updated; theta/psi are untouched here.
             def outer_task_fn(state, fast_params, reference):
+                if args.meta_scope == 'counterfactual':
+                    return core_model.bilevel_task_losses(
+                        state,
+                        fast_params,
+                        reference,
+                        fine_targets,
+                        sub_targets,
+                        basic_targets,
+                        leaf_index,
+                        sub_index,
+                        species_to_family=species_to_family,
+                        species_to_order=species_to_order,
+                        consistency_weight=args.meta_consistency_weight,
+                    )
                 return core_model.bilevel_task_loss(
                     state,
                     fast_params,
@@ -200,6 +223,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     task_weight=args.meta_task_weight,
                     semantic_weight=args.meta_semantic_weight,
                     router_kl_weight=args.meta_router_kl_weight,
+                    task_level_weights=(
+                        args.meta_fine_weight,
+                        args.meta_family_weight,
+                        args.meta_basic_weight,
+                    ),
+                    router_advantage_scale=args.meta_router_advantage_scale,
                 )
             policy_params = tuple(
                 core_model.bilevel.policy_parameters(args.meta_scope)
@@ -229,6 +258,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                 support_meta_state,
                 scope=args.meta_scope,
                 relation_weight=args.meta_relation_weight,
+                task_level_weights=(
+                    args.meta_fine_weight,
+                    args.meta_family_weight,
+                    args.meta_basic_weight,
+                ),
             )
             meta_stats.update(real_stats)
 
