@@ -229,14 +229,29 @@ def get_args_parser():
     parser.add_argument('--meta-start-epoch', default=5, type=int,
                         help='warm up semantic tokens before enabling the meta step')
     parser.add_argument('--meta-q', default='uniform', choices=['uniform', 'hvp'])
-    parser.add_argument('--meta-scope', default='relation',
-                        choices=['part', 'relation', 'hybrid'],
-                        help='V6 defaults to configuration relations; hybrid also keeps V5 parts')
+    parser.add_argument('--meta-scope', default='adaptive',
+                        choices=['part', 'relation', 'hybrid', 'adaptive'],
+                        help='adaptive learns skip/local/relation routing from query task feedback')
     parser.add_argument('--meta-relation-weight', default=1.0, type=float)
+    parser.add_argument('--meta-task-weight', default=1.0, type=float)
+    parser.add_argument('--meta-semantic-weight', default=0.1, type=float)
+    parser.add_argument('--meta-router-kl-weight', default=0.001, type=float)
+    parser.add_argument('--meta-fine-weight', default=1.0, type=float)
+    parser.add_argument('--meta-family-weight', default=0.5, type=float)
+    parser.add_argument('--meta-basic-weight', default=0.5, type=float)
     parser.add_argument('--relation-hvp-samples', default=1, type=int,
                         help='Hutchinson probes for relation-level HVP curvature')
+    parser.add_argument('--relation-dim', default=64, type=int,
+                        help='low-rank relation representation dimension')
+    parser.add_argument('--relation-contrastive-weight', default=0.1, type=float)
+    parser.add_argument('--relation-temperature', default=0.1, type=float)
+    parser.add_argument('--router-hidden-dim', default=32, type=int)
+    parser.add_argument('--router-prior', default=(0.50, 0.45, 0.05),
+                        nargs=3, type=float, metavar=('SKIP', 'PART', 'REL'))
     parser.add_argument('--no-relation-hvp', action='store_true',
                         help='replace relation HVP by its endpoint part-curvature prior')
+    parser.add_argument('--allow-random-init', action='store_true',
+                        help='explicitly allow bilevel training without pretrained weights')
     
     
     return parser
@@ -249,6 +264,21 @@ def main(args):
 
     if args.distillation_type != 'none' and args.finetune and not args.eval:
         raise NotImplementedError("Finetuning with distillation not yet supported")
+
+    if (
+        args.enable_bilevel
+        and not args.eval
+        and not args.finetune
+        and not args.resume
+        and not args.pretrained
+        and not args.allow_random_init
+    ):
+        raise ValueError(
+            "Bilevel fine-grained training requires ImageNet initialization. "
+            "Pass --finetune /path/to/deit_small_patch16_224-cd65a155.pth, "
+            "--resume a compatible V7 checkpoint, or explicitly acknowledge "
+            "an ablation with --allow-random-init."
+        )
 
     device = torch.device(args.device)
 
@@ -359,6 +389,11 @@ def main(args):
         meta_scope=args.meta_scope,
         relation_hvp_samples=args.relation_hvp_samples,
         enable_relation_hvp=(not args.no_relation_hvp),
+        relation_dim=args.relation_dim,
+        relation_contrastive_weight=args.relation_contrastive_weight,
+        relation_temperature=args.relation_temperature,
+        router_hidden_dim=args.router_hidden_dim,
+        router_prior=tuple(args.router_prior),
     )
     print(model)
                     

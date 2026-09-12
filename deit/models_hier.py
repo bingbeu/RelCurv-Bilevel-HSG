@@ -43,9 +43,14 @@ class HierVisionTransformer(VisionTransformer):
         meta_reference_mix = kwargs.pop('meta_reference_mix', 0.5)
         semantic_diversity_weight = kwargs.pop('semantic_diversity_weight', 0.01)
         semantic_bridge_weight = kwargs.pop('semantic_bridge_weight', 0.1)
-        meta_scope = kwargs.pop('meta_scope', 'relation')
+        meta_scope = kwargs.pop('meta_scope', 'adaptive')
         relation_hvp_samples = kwargs.pop('relation_hvp_samples', 1)
         enable_relation_hvp = kwargs.pop('enable_relation_hvp', True)
+        relation_dim = kwargs.pop('relation_dim', 64)
+        router_hidden_dim = kwargs.pop('router_hidden_dim', 32)
+        router_prior = kwargs.pop('router_prior', (0.50, 0.45, 0.05))
+        relation_contrastive_weight = kwargs.pop('relation_contrastive_weight', 0.1)
+        relation_temperature = kwargs.pop('relation_temperature', 0.1)
 
         super().__init__(*args, **kwargs)
         #self.pos_embed = nn.Parameter(torch.randn(1, self.embed_len, self.embed_dim) * .02)
@@ -122,20 +127,14 @@ class HierVisionTransformer(VisionTransformer):
                 policy_tau=meta_policy_tau,
                 reference_mix=meta_reference_mix,
                 diversity_weight=semantic_diversity_weight,
-                enable_relations=(meta_scope in ('relation', 'hybrid')),
+                enable_relations=(meta_scope in ('relation', 'hybrid', 'adaptive')),
                 relation_hvp_samples=relation_hvp_samples,
+                relation_dim=relation_dim,
+                router_hidden_dim=router_hidden_dim,
+                router_prior=router_prior,
+                relation_contrastive_weight=relation_contrastive_weight,
+                relation_temperature=relation_temperature,
             )
-            if meta_scope in ('relation', 'hybrid'):
-                # Independent zero-gated configuration residual.  CUB can keep
-                # this gate near zero while Aircraft can activate relations.
-                self.relation_cls_adapter = nn.Sequential(
-                    nn.LayerNorm(self.embed_dim),
-                    nn.Linear(self.embed_dim, self.embed_dim),
-                    nn.GELU(),
-                    nn.Linear(self.embed_dim, self.embed_dim),
-                )
-                self.relation_cls_adapter.apply(self._init_weights)
-                self.relation_gate = nn.Parameter(torch.zeros(()))
 
     def forward_features(self, x):
         # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
@@ -165,18 +164,19 @@ class HierVisionTransformer(VisionTransformer):
        
         return intermediates
 
-    def forward(self, x, caps_embed=None, compute_hvp=None):
+    def forward(self, x, caps_embed=None, compute_hvp=None, build_relations=None):
         intermediates = self.forward_features(x)
         if self.len_classes == 3:
             B = x.shape[0]
             # 用最后一层 patch tokens 作为 V4 的视觉输入
             x_tokens = intermediates[4][:, 1:]                     # (B, 196, embed_dim)
             cls_s = self.norm(intermediates[4][:, 0])              # fine-level CLS
+            cls_f = self.norm(intermediates[3][:, 0])              # family-level CLS
+            cls_o = self.norm(intermediates[2][:, 0])              # order-level CLS
 
             visual_semantics = None
             text_semantics = None
             meta_state = None
-            relation_feat = None
             if self.enable_bilevel:
                 # P distinct visual semantic tokens are used in both train/eval.
                 visual_semantics = self.bilevel.visual_semantics(cls_s)
@@ -214,7 +214,21 @@ class HierVisionTransformer(VisionTransformer):
                     target_semantics,
                     aux['part_curvature'],
                 )
-                if self.meta_scope in ('relation', 'hybrid'):
+                meta_state.update({
+                    'fine_cls': cls_s,
+                    'family_cls': cls_f,
+                    'basic_cls': cls_o,
+                })
+                # Relations are a training-time update signal. They are not a
+                # second inference branch and therefore add no test-time path.
+                should_build_relations = (
+                    self.training if build_relations is None
+                    else bool(build_relations)
+                )
+                if (
+                    should_build_relations
+                    and self.meta_scope in ('relation', 'hybrid', 'adaptive')
+                ):
                     relation_compute_hvp = (
                         self.enable_relation_hvp
                         and (self.training if compute_hvp is None else bool(compute_hvp))
@@ -228,24 +242,17 @@ class HierVisionTransformer(VisionTransformer):
                         compute_hvp=relation_compute_hvp,
                     )
                     meta_state['relation_state'] = relation_state
-                    relation_feat, _ = self.bilevel.pool_relations(relation_state)
             else:
                 part_feat = part_tokens.mean(dim=1)
 
             # [E2] part 作为残差 delta，零门控初始等价 baseline；第一轮只让 fine 层用 part
             delta = self.part_adapter(part_feat)                  # (B, embed_dim)
             gate = torch.tanh(self.part_gate)                     # (3,)，初始 0
-            cls_f = self.norm(intermediates[3][:, 0])             # 科级 CLS
-            cls_o = self.norm(intermediates[2][:, 0])             # 目级 CLS
-            fine_feature = cls_s + gate[0] * delta
-            if relation_feat is not None:
-                relation_delta = self.relation_cls_adapter(relation_feat)
-                fine_feature = (
-                    fine_feature + torch.tanh(self.relation_gate) * relation_delta
-                )
-            out = self.head(fine_feature)
-            family_out = self.family_head(cls_f)
-            manu_out = self.manufacturer_head(cls_o)
+            # Relation evidence changes the shared semantic adapter through the
+            # inner update; it is never concatenated into the classifier.
+            out = self.head(cls_s + gate[0] * delta)
+            family_out = self.family_head(cls_f + gate[1] * delta)
+            manu_out = self.manufacturer_head(cls_o + gate[2] * delta)
 
             feats = intermediates[4][:, 1:]
             feats = self.feats_layer(feats.view(feats.size(0), -1))
@@ -284,13 +291,48 @@ class HierVisionTransformer(VisionTransformer):
             family_out = self.family_head(intermediates[4][:, 0])
             return out, family_out
 
+    def bilevel_task_loss(
+        self, state, adapter_params, reference, fine_targets, sub_targets,
+        basic_targets, leaf_index, sub_index, fine_weight=1.0,
+        family_weight=0.5, basic_weight=0.5,
+    ):
+        """Fixed-reference hierarchical evaluator for the virtual update."""
+        adapted = self.bilevel.adapt_parts(
+            state['part_tokens'].detach().float(), adapter_params
+        )
+        q = reference.detach().to(dtype=adapted.dtype)
+        part_feat = (q.unsqueeze(-1) * adapted).sum(dim=1)
+        delta = self.part_adapter(part_feat)
+        gate = torch.tanh(self.part_gate.float())
+        fine_logits = self.head(state['fine_cls'].detach().float() + gate[0] * delta)
+        family_logits = self.family_head(
+            state['family_cls'].detach().float() + gate[1] * delta
+        )
+        basic_logits = self.manufacturer_head(
+            state['basic_cls'].detach().float() + gate[2] * delta
+        )
+        loss = fine_logits.new_zeros(())
+        if leaf_index.numel() > 0 and float(fine_weight) != 0.0:
+            loss = loss + float(fine_weight) * F.cross_entropy(
+                fine_logits.index_select(0, leaf_index),
+                fine_targets.index_select(0, leaf_index),
+            )
+        if sub_index.numel() > 0 and float(family_weight) != 0.0:
+            loss = loss + float(family_weight) * F.cross_entropy(
+                family_logits.index_select(0, sub_index),
+                sub_targets.index_select(0, sub_index),
+            )
+        if float(basic_weight) != 0.0:
+            loss = loss + float(basic_weight) * F.cross_entropy(
+                basic_logits, basic_targets
+            )
+        return loss
+
     @torch.jit.ignore
     def no_weight_decay(self):
         # 门控(0 维标量)/可学习 token 不落入 timm 的 decay 组（timm 只用 len(shape)==1 判定）
         nd = set(super().no_weight_decay())
         nd.update({'category_token', 'attr_proto', 'part_gate'})
-        if hasattr(self, 'relation_gate'):
-            nd.add('relation_gate')
         if self.enable_bilevel:
             nd.update({
                 'bilevel.bridge.anchors',
