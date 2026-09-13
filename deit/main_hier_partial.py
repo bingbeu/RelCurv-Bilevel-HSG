@@ -252,7 +252,7 @@ def get_args_parser():
     parser.add_argument('--meta-task-weight', default=1.0, type=float)
     parser.add_argument('--meta-semantic-weight', default=0.1, type=float)
     parser.add_argument('--meta-router-kl-weight', default=0.001, type=float)
-    parser.add_argument('--meta-router-advantage-scale', default=1.0, type=float,
+    parser.add_argument('--meta-router-advantage-scale', default=0.1, type=float,
                         help=('scale normalized post-update branch regret in the '
                               'counterfactual outer objective'))
     parser.add_argument(
@@ -273,6 +273,11 @@ def get_args_parser():
               'counterfactual Part/Relation branch may update the real model'),
     )
     parser.add_argument(
+        '--meta-safe-route-budget', default=0.05, type=float,
+        help=('maximum non-Skip probability assigned by the two-stage '
+              'counterfactual route; must be between zero and one'),
+    )
+    parser.add_argument(
         '--no-meta-safe-gate', action='store_true',
         help='ablate positive-gain gating of the real counterfactual update',
     )
@@ -290,7 +295,9 @@ def get_args_parser():
     parser.add_argument('--relation-temperature', default=0.1, type=float)
     parser.add_argument('--router-hidden-dim', default=32, type=int)
     parser.add_argument('--router-prior', default=(0.50, 0.45, 0.05),
-                        nargs=3, type=float, metavar=('SKIP', 'PART', 'REL'))
+                        nargs=3, type=float, metavar=('SKIP', 'PART', 'REL'),
+                        help=('router prior; counterfactual V8.3 uses only the '
+                              'Part-to-Relation ratio'))
     parser.add_argument('--no-relation-hvp', action='store_true',
                         help='replace relation HVP by its endpoint part-curvature prior')
     parser.add_argument('--allow-random-init', action='store_true',

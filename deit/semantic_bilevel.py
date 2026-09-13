@@ -11,10 +11,10 @@ Only the post-update outer objective updates ``phi``.
 
 V8 adds a branch-counterfactual, all-level route.  Skip, part and relation
 updates are unrolled independently and evaluated on Species, Family and Order
-losses.  V8.2 additionally calibrates branch regret inside every example and
-hierarchy level, so useful subpopulations are not erased by dataset averaging.
-The router therefore receives nine identifiable, scale-stable decisions instead
-of one gradient through a pre-mixed update.
+losses.  V8.2 calibrates branch regret inside every example and hierarchy
+level.  V8.3 separates safety from semantic selection: stopped positive-gain
+evidence decides Skip, while the differentiable router chooses only between
+eligible Part and Relation updates under a bounded real-update budget.
 """
 
 import math
@@ -169,6 +169,9 @@ class AdaptiveGranularityRouter(nn.Module):
 
     ``num_tasks=1`` preserves the V7 global router exactly.  ``num_tasks=3``
     produces a task-by-branch matrix for fine/species, family and basic/order.
+    V8.3 retains the three logits for checkpoint compatibility, but its
+    counterfactual solver removes the Skip logit and normalizes only the Part
+    and Relation logits after the positive-gain safety decision.
     """
 
     TASK_NAMES = ("species", "family", "order")
@@ -754,6 +757,56 @@ class BilevelSemanticController(nn.Module):
         return calibrated, regret_rms
 
     @staticmethod
+    def _two_stage_counterfactual_route(
+        learned_route: torch.Tensor,
+        branch_eligibility: Optional[torch.Tensor],
+        non_skip_budget: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Let safety decide Skip and learn only Part-versus-Relation.
+
+        ``learned_route`` keeps the legacy Skip/Part/Relation shape, but its
+        Skip logit is intentionally removed by conditioning on the two
+        semantic branches.  Eligibility is stopped counterfactual evidence.
+        Whenever at least one branch is eligible, exactly ``non_skip_budget``
+        probability is assigned across eligible semantic branches; otherwise
+        the route is pure Skip.
+        """
+        if learned_route.size(-1) != 3:
+            raise ValueError("two-stage route requires Skip/Part/Relation logits")
+        if not 0.0 <= float(non_skip_budget) <= 1.0:
+            raise ValueError("counterfactual non-Skip budget must be in [0, 1]")
+
+        semantic_route = learned_route[..., 1:]
+        conditional_route = semantic_route / semantic_route.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1.0e-8)
+        if branch_eligibility is None:
+            eligible = torch.ones_like(conditional_route)
+        else:
+            if tuple(branch_eligibility.shape) != tuple(conditional_route.shape):
+                raise ValueError(
+                    "counterfactual branch eligibility must have shape "
+                    f"{tuple(conditional_route.shape)}, got "
+                    f"{tuple(branch_eligibility.shape)}"
+                )
+            eligible = branch_eligibility.detach().to(
+                device=conditional_route.device,
+                dtype=conditional_route.dtype,
+            )
+
+        eligible_route = conditional_route * eligible
+        eligible_mass = eligible_route.sum(dim=-1, keepdim=True)
+        has_eligible = eligible_mass.gt(0.0)
+        eligible_route = eligible_route / eligible_mass.clamp_min(1.0e-8)
+        semantic_budget = has_eligible.to(conditional_route.dtype) * float(
+            non_skip_budget
+        )
+        safe_non_skip = semantic_budget * eligible_route
+        safe_skip = 1.0 - safe_non_skip.sum(dim=-1, keepdim=True)
+        safe_route = torch.cat((safe_skip, safe_non_skip), dim=-1)
+        return safe_route, conditional_route, has_eligible.squeeze(-1)
+
+    @staticmethod
     def _task_output(
         value,
         batch_size: int,
@@ -829,6 +882,8 @@ class BilevelSemanticController(nn.Module):
         safe_improvement_margin: float,
         normalize_router_regret: bool,
         router_regret_floor: float,
+        safe_route_budget: float,
+        safe_gate: bool,
     ):
         """Three virtual branches evaluated independently at all three levels."""
         if not self.enable_relations:
@@ -845,6 +900,8 @@ class BilevelSemanticController(nn.Module):
             raise ValueError("safe improvement margin must be nonnegative")
         if router_regret_floor <= 0:
             raise ValueError("router regret floor must be positive")
+        if not 0.0 <= float(safe_route_budget) <= 1.0:
+            raise ValueError("safe route budget must be in [0, 1]")
 
         level_weights = torch.as_tensor(
             task_level_weights, dtype=torch.float32,
@@ -979,10 +1036,6 @@ class BilevelSemanticController(nn.Module):
             )
             return (level_weights * task_means).sum()
 
-        expected_task_per_level = (route * branch_task_loss).sum(dim=-1)
-        outer_task = weighted_task_reduce(expected_task_per_level)
-        task_before = weighted_task_reduce(branch_task_loss[:, :, 0])
-
         # Normalized counterfactual regret strengthens only between-branch
         # evidence.  The skip baseline is common to all routes and contributes
         # no artificial preference.
@@ -991,28 +1044,44 @@ class BilevelSemanticController(nn.Module):
             branch_task_loss - skip_task.unsqueeze(-1)
         ) / skip_task.abs().unsqueeze(-1).clamp_min(1.0e-3)
         relative_regret = relative_regret.clamp(min=-10.0, max=10.0)
-        raw_expected_regret = (route * relative_regret).sum(dim=-1)
-        raw_router_objective = weighted_task_reduce(raw_expected_regret)
         calibrated_regret, regret_rms = self._calibrate_counterfactual_regret(
             relative_regret,
             improvement_margin=safe_improvement_margin,
             scale_floor=router_regret_floor,
             normalize=normalize_router_regret,
         )
-        expected_regret = (route * calibrated_regret).sum(dim=-1)
-        router_objective = weighted_task_reduce(expected_regret)
-
-        # The main-model update is allowed to use a non-skip branch only when
-        # that exact support/query pair improved by more than a numerical-noise
-        # margin.  Rejected probability is transferred to skip later, after the
-        # meta optimizer updates the router.  The mask is stopped: it cannot
-        # become a shortcut around the counterfactual hypergradient.
+        # The stopped gate owns the Skip decision.  The learned router is
+        # conditioned on semantic updates and can only choose Part versus
+        # Relation.  This prevents expected-regret training from escaping into
+        # the global all-Skip solution observed in V8.1/V8.2.
         relative_gain = -relative_regret.detach()[:, :, 1:]
         branch_eligibility = (
             (relative_gain > float(safe_improvement_margin))
             & task_mask.bool().unsqueeze(-1)
         )
+        route_eligibility = branch_eligibility if safe_gate else None
+        two_stage_route, conditional_route, has_eligible = (
+            self._two_stage_counterfactual_route(
+                route,
+                route_eligibility,
+                non_skip_budget=safe_route_budget,
+            )
+        )
         best_branch = calibrated_regret.detach().argmin(dim=-1)
+
+        expected_task_per_level = (
+            two_stage_route * branch_task_loss
+        ).sum(dim=-1)
+        outer_task = weighted_task_reduce(expected_task_per_level)
+        task_before = weighted_task_reduce(branch_task_loss[:, :, 0])
+        raw_expected_regret = (
+            two_stage_route * relative_regret
+        ).sum(dim=-1)
+        raw_router_objective = weighted_task_reduce(raw_expected_regret)
+        expected_regret = (
+            two_stage_route * calibrated_regret
+        ).sum(dim=-1)
+        router_objective = weighted_task_reduce(expected_regret)
 
         # Convert task-specific routes into one per-example semantic route only
         # for the auxiliary alignment evaluator.  Classification routing remains
@@ -1020,14 +1089,21 @@ class BilevelSemanticController(nn.Module):
         route_weight = weighted_mask / weighted_mask.sum(
             dim=1, keepdim=True
         ).clamp_min(1.0)
-        semantic_route = (route_weight.unsqueeze(-1) * route).sum(dim=1)
+        semantic_route = (
+            route_weight.unsqueeze(-1) * two_stage_route
+        ).sum(dim=1)
         outer_align = (semantic_route * branch_align_loss).sum(dim=-1).mean()
         align_before = branch_align_loss[:, 0].mean()
 
         prior = self.router.prior.to(route)
-        router_kl = (
-            route * (route.clamp_min(1e-8).log() - prior.log())
-        ).sum(dim=-1).mean()
+        conditional_prior = prior[1:] / prior[1:].sum().clamp_min(1.0e-8)
+        conditional_kl = (
+            conditional_route * (
+                conditional_route.clamp_min(1.0e-8).log()
+                - conditional_prior.clamp_min(1.0e-8).log()
+            )
+        ).sum(dim=-1)
+        router_kl = weighted_task_reduce(conditional_kl)
         meta_loss = (
             float(task_weight) * (
                 outer_task + float(router_advantage_scale) * router_objective
@@ -1040,6 +1116,8 @@ class BilevelSemanticController(nn.Module):
         def masked_level_mean(value: torch.Tensor, task_idx: int) -> torch.Tensor:
             mask = task_mask[:, task_idx]
             return (value[:, task_idx] * mask).sum() / mask.sum().clamp_min(1.0)
+
+        route_denominator = task_mask.sum().clamp_min(1.0)
 
         stats: Dict[str, torch.Tensor] = {
             "meta_loss": meta_loss.detach(),
@@ -1070,6 +1148,18 @@ class BilevelSemanticController(nn.Module):
             "meta_improvement": (align_before - outer_align).detach(),
             "meta_policy_kl": (part_kl + relation_kl).detach(),
             "meta_router_kl": router_kl.detach(),
+            "two_stage_route_skip": (
+                two_stage_route[:, :, 0] * task_mask
+            ).sum().div(route_denominator).detach(),
+            "two_stage_route_part": (
+                two_stage_route[:, :, 1] * task_mask
+            ).sum().div(route_denominator).detach(),
+            "two_stage_route_relation": (
+                two_stage_route[:, :, 2] * task_mask
+            ).sum().div(route_denominator).detach(),
+            "two_stage_active_rate": (
+                has_eligible.float() * task_mask
+            ).sum().div(route_denominator).detach(),
         }
         task_names = AdaptiveGranularityRouter.TASK_NAMES
         for task_idx, task_name in enumerate(task_names):
@@ -1094,6 +1184,24 @@ class BilevelSemanticController(nn.Module):
                     branch_eligibility[:, task_idx, 1].float()
                     * task_mask[:, task_idx]
                 ).sum().div(task_mask[:, task_idx].sum().clamp_min(1.0)).detach(),
+                f"conditional_{task_name}_part": masked_level_mean(
+                    conditional_route[:, :, 0], task_idx
+                ).detach(),
+                f"conditional_{task_name}_relation": masked_level_mean(
+                    conditional_route[:, :, 1], task_idx
+                ).detach(),
+                f"two_stage_{task_name}_skip": masked_level_mean(
+                    two_stage_route[:, :, 0], task_idx
+                ).detach(),
+                f"two_stage_{task_name}_part": masked_level_mean(
+                    two_stage_route[:, :, 1], task_idx
+                ).detach(),
+                f"two_stage_{task_name}_relation": masked_level_mean(
+                    two_stage_route[:, :, 2], task_idx
+                ).detach(),
+                f"two_stage_{task_name}_active_rate": masked_level_mean(
+                    has_eligible.float(), task_idx
+                ).detach(),
             })
             for branch_idx, branch_name in enumerate(
                 ("skip", "part", "relation")
@@ -1132,6 +1240,8 @@ class BilevelSemanticController(nn.Module):
         safe_improvement_margin: float = 0.0,
         normalize_router_regret: bool = False,
         router_regret_floor: float = 1.0e-4,
+        safe_route_budget: float = 0.05,
+        safe_gate: bool = True,
         return_aux: bool = False,
     ):
         """Joint one-step inner update with a task-feedback query evaluator.
@@ -1159,6 +1269,8 @@ class BilevelSemanticController(nn.Module):
                 safe_improvement_margin=safe_improvement_margin,
                 normalize_router_regret=normalize_router_regret,
                 router_regret_floor=router_regret_floor,
+                safe_route_budget=safe_route_budget,
+                safe_gate=safe_gate,
             )
             return result if return_aux else result[:2]
         use_part = scope in ("part", "hybrid", "adaptive")
@@ -1317,6 +1429,7 @@ class BilevelSemanticController(nn.Module):
         relation_weight: float = 1.0,
         task_level_weights: Tuple[float, float, float] = (1.0, 0.5, 0.5),
         branch_eligibility: Optional[torch.Tensor] = None,
+        safe_route_budget: float = 0.05,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Real shared-adapter loss with every learned policy detached."""
         self._check_scope(scope)
@@ -1375,42 +1488,52 @@ class BilevelSemanticController(nn.Module):
                 part_error.detach(), relation_error.detach(),
                 state["curvature"].detach(), relation_curvature.detach(),
             )
-            if branch_eligibility is not None:
-                expected_shape = (part_error.size(0), 3, 2)
-                if tuple(branch_eligibility.shape) != expected_shape:
-                    raise ValueError(
-                        "counterfactual branch eligibility must have shape "
-                        f"{expected_shape}, got {tuple(branch_eligibility.shape)}"
-                    )
-                eligible = branch_eligibility.detach().to(
-                    device=task_route.device, dtype=task_route.dtype
+            task_route, conditional_route, has_eligible = (
+                self._two_stage_counterfactual_route(
+                    task_route,
+                    branch_eligibility,
+                    non_skip_budget=safe_route_budget,
                 )
-                safe_non_skip = task_route[:, :, 1:] * eligible
-                safe_skip = 1.0 - safe_non_skip.sum(dim=-1, keepdim=True)
-                task_route = torch.cat((safe_skip, safe_non_skip), dim=-1)
-                safe_entropy = -(
-                    task_route * task_route.clamp_min(1.0e-8).log()
-                ).sum(dim=-1)
+            )
+            safe_entropy = -(
+                task_route * task_route.clamp_min(1.0e-8).log()
+            ).sum(dim=-1)
+            route_stats.update({
+                "safe_route_skip": task_route[:, :, 0].mean().detach(),
+                "safe_route_part": task_route[:, :, 1].mean().detach(),
+                "safe_route_relation": task_route[:, :, 2].mean().detach(),
+                "safe_route_entropy": safe_entropy.mean().detach(),
+                "safe_route_active_rate": has_eligible.float().mean().detach(),
+                "conditional_route_part": (
+                    conditional_route[:, :, 0].mean().detach()
+                ),
+                "conditional_route_relation": (
+                    conditional_route[:, :, 1].mean().detach()
+                ),
+            })
+            for task_idx, task_name in enumerate(
+                AdaptiveGranularityRouter.TASK_NAMES
+            ):
                 route_stats.update({
-                    "safe_route_skip": task_route[:, :, 0].mean().detach(),
-                    "safe_route_part": task_route[:, :, 1].mean().detach(),
-                    "safe_route_relation": task_route[:, :, 2].mean().detach(),
-                    "safe_route_entropy": safe_entropy.mean().detach(),
+                    f"safe_route_{task_name}_skip": (
+                        task_route[:, task_idx, 0].mean().detach()
+                    ),
+                    f"safe_route_{task_name}_part": (
+                        task_route[:, task_idx, 1].mean().detach()
+                    ),
+                    f"safe_route_{task_name}_relation": (
+                        task_route[:, task_idx, 2].mean().detach()
+                    ),
+                    f"safe_route_{task_name}_active_rate": (
+                        has_eligible[:, task_idx].float().mean().detach()
+                    ),
+                    f"conditional_route_{task_name}_part": (
+                        conditional_route[:, task_idx, 0].mean().detach()
+                    ),
+                    f"conditional_route_{task_name}_relation": (
+                        conditional_route[:, task_idx, 1].mean().detach()
+                    ),
                 })
-                for task_idx, task_name in enumerate(
-                    AdaptiveGranularityRouter.TASK_NAMES
-                ):
-                    route_stats.update({
-                        f"safe_route_{task_name}_skip": (
-                            task_route[:, task_idx, 0].mean().detach()
-                        ),
-                        f"safe_route_{task_name}_part": (
-                            task_route[:, task_idx, 1].mean().detach()
-                        ),
-                        f"safe_route_{task_name}_relation": (
-                            task_route[:, task_idx, 2].mean().detach()
-                        ),
-                    })
             level_weights = torch.as_tensor(
                 task_level_weights, device=task_route.device,
                 dtype=task_route.dtype,

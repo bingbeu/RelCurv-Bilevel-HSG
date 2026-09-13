@@ -258,6 +258,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                         args.meta_router_regret_normalization
                     ),
                     router_regret_floor=args.meta_router_regret_floor,
+                    safe_route_budget=args.meta_safe_route_budget,
+                    safe_gate=not args.no_meta_safe_gate,
                     return_aux=True,
                 )
             policy_params = tuple(
@@ -297,6 +299,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     None if args.no_meta_safe_gate
                     else meta_aux.get('branch_eligibility')
                 ),
+                safe_route_budget=args.meta_safe_route_budget,
             )
             meta_stats.update(real_stats)
 

@@ -1,4 +1,4 @@
-"""CPU tests for safe all-level counterfactual bilevel invariants."""
+"""CPU tests for two-stage safe counterfactual bilevel invariants."""
 
 import unittest
 
@@ -120,6 +120,8 @@ class BilevelSemanticControllerTest(unittest.TestCase):
             safe_improvement_margin=1.0e-5,
             normalize_router_regret=True,
             router_regret_floor=1.0e-4,
+            safe_route_budget=0.05,
+            safe_gate=False,
             return_aux=True,
         )
         router_params = tuple(controller.router.parameters())
@@ -142,6 +144,11 @@ class BilevelSemanticControllerTest(unittest.TestCase):
         self.assertIn("candidate_species_skip_rate", stats)
         self.assertIn("candidate_family_part_rate", stats)
         self.assertIn("candidate_order_relation_rate", stats)
+        self.assertIn("two_stage_route_skip", stats)
+        self.assertIn("conditional_species_part", stats)
+        self.assertAlmostEqual(
+            stats["two_stage_route_skip"].item(), 0.95, places=6
+        )
         self.assertAlmostEqual(
             stats["meta_part_inner_step_norm"].item(), 0.1, places=5
         )
@@ -194,6 +201,39 @@ class BilevelSemanticControllerTest(unittest.TestCase):
                 scope="counterfactual",
                 branch_eligibility=torch.ones(self.batch, 2),
             )
+
+    def test_two_stage_route_ignores_skip_and_respects_budget(self):
+        learned = torch.tensor([[[0.99, 0.009, 0.001]]])
+        both = torch.tensor([[[True, True]]])
+        route, conditional, active = (
+            self.controller._two_stage_counterfactual_route(
+                learned, both, non_skip_budget=0.05
+            )
+        )
+        self.assertTrue(torch.allclose(
+            conditional, torch.tensor([[[0.9, 0.1]]])
+        ))
+        self.assertTrue(torch.allclose(
+            route, torch.tensor([[[0.95, 0.045, 0.005]]])
+        ))
+        self.assertTrue(active.item())
+
+        relation_only = torch.tensor([[[False, True]]])
+        route, _, _ = self.controller._two_stage_counterfactual_route(
+            learned, relation_only, non_skip_budget=0.05
+        )
+        self.assertTrue(torch.allclose(
+            route, torch.tensor([[[0.95, 0.0, 0.05]]])
+        ))
+
+        none = torch.tensor([[[False, False]]])
+        route, _, active = self.controller._two_stage_counterfactual_route(
+            learned, none, non_skip_budget=0.05
+        )
+        self.assertTrue(torch.allclose(
+            route, torch.tensor([[[1.0, 0.0, 0.0]]])
+        ))
+        self.assertFalse(active.item())
 
     def test_counterfactual_regret_calibration_preserves_branch_order(self):
         regret = torch.tensor([
