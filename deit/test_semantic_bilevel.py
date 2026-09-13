@@ -1,4 +1,4 @@
-"""CPU tests for confidence-budgeted counterfactual bilevel invariants."""
+"""CPU tests for consistency-credited counterfactual bilevel invariants."""
 
 import unittest
 
@@ -96,14 +96,26 @@ class BilevelSemanticControllerTest(unittest.TestCase):
                 state["part_tokens"].detach().float(), params
             )
             pooled = (reference.unsqueeze(-1) * adapted).sum(dim=1)
-            losses = torch.stack(
+            classification_losses = torch.stack(
                 [
                     (pooled - targets[:, task_idx]).square().mean(dim=-1)
                     for task_idx in range(3)
                 ],
                 dim=1,
             )
-            return losses, torch.ones_like(losses)
+            consistency_losses = torch.stack(
+                [
+                    (pooled - 0.5 * targets[:, task_idx]).square().mean(dim=-1)
+                    for task_idx in range(3)
+                ],
+                dim=1,
+            )
+            return {
+                "losses": classification_losses + 0.1 * consistency_losses,
+                "mask": torch.ones_like(classification_losses),
+                "classification_losses": classification_losses,
+                "consistency_losses": consistency_losses,
+            }
 
         meta_loss, stats, aux = controller.meta_objective(
             support,
@@ -121,6 +133,7 @@ class BilevelSemanticControllerTest(unittest.TestCase):
             normalize_router_regret=True,
             router_regret_floor=1.0e-4,
             safe_route_budget=0.05,
+            consistency_credit_weight=0.25,
             safe_gate=False,
             return_aux=True,
         )
@@ -141,6 +154,10 @@ class BilevelSemanticControllerTest(unittest.TestCase):
         self.assertIn("meta_relation_task_improvement", stats)
         self.assertIn("meta_router_raw_objective", stats)
         self.assertIn("meta_router_regret_rms", stats)
+        self.assertIn("meta_router_classification_regret_rms", stats)
+        self.assertIn("meta_router_consistency_regret_rms", stats)
+        self.assertIn("meta_part_classification_improvement", stats)
+        self.assertIn("meta_relation_consistency_improvement", stats)
         self.assertIn("candidate_species_skip_rate", stats)
         self.assertIn("candidate_family_part_rate", stats)
         self.assertIn("candidate_order_relation_rate", stats)
@@ -244,7 +261,7 @@ class BilevelSemanticControllerTest(unittest.TestCase):
         self.assertFalse(active.item())
         self.assertEqual(effective_budget.item(), 0.0)
 
-    def test_confidence_budget_scales_but_never_exceeds_cap(self):
+    def test_confidence_reallocates_fixed_safe_budget(self):
         learned = torch.tensor([[[0.50, 0.45, 0.05]]])
         eligible = torch.tensor([[[True, True]]])
         confidence = torch.tensor([[[0.25, 0.75]]])
@@ -258,9 +275,11 @@ class BilevelSemanticControllerTest(unittest.TestCase):
             )
         )
         self.assertTrue(active.item())
-        self.assertAlmostEqual(effective_budget.item(), 0.0375, places=7)
-        self.assertAlmostEqual(route[..., 0].item(), 0.9625, places=7)
-        self.assertAlmostEqual(route[..., 1:].sum().item(), 0.0375, places=7)
+        self.assertAlmostEqual(effective_budget.item(), 0.05, places=7)
+        self.assertAlmostEqual(route[..., 0].item(), 0.95, places=7)
+        self.assertAlmostEqual(route[..., 1].item(), 0.0375, places=7)
+        self.assertAlmostEqual(route[..., 2].item(), 0.0125, places=7)
+        self.assertAlmostEqual(route[..., 1:].sum().item(), 0.05, places=7)
 
         part_only = torch.tensor([[[True, False]]])
         route, _, _, effective_budget = (
@@ -272,8 +291,8 @@ class BilevelSemanticControllerTest(unittest.TestCase):
                 confidence_scale=1.0,
             )
         )
-        self.assertAlmostEqual(effective_budget.item(), 0.0125, places=7)
-        self.assertAlmostEqual(route[..., 1].item(), 0.0125, places=7)
+        self.assertAlmostEqual(effective_budget.item(), 0.05, places=7)
+        self.assertAlmostEqual(route[..., 1].item(), 0.05, places=7)
         self.assertEqual(route[..., 2].item(), 0.0)
 
         saturated = torch.tensor([[[4.0, 2.0]]])
