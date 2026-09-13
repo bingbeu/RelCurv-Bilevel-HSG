@@ -364,6 +364,8 @@ class HierVisionTransformer(VisionTransformer):
         )
         basic_mask = torch.ones_like(basic_loss)
 
+        family_consistency = zero
+        order_consistency = zero
         if float(consistency_weight) != 0.0:
             if species_to_family is None or species_to_order is None:
                 raise RuntimeError(
@@ -398,19 +400,36 @@ class HierVisionTransformer(VisionTransformer):
             # consistency evaluator to every example.  This uses only predicted
             # distributions and the fixed taxonomy, never an unavailable label.
             family_scale = float(batch_size) / family_mask.sum().clamp_min(1.0)
-            family_loss = (
-                family_scale * family_loss
-                + float(consistency_weight) * family_consistency
-            )
+            family_loss = family_scale * family_loss
             family_mask = torch.ones_like(family_mask)
-            basic_loss = (
-                basic_loss + float(consistency_weight) * order_consistency
-            )
 
-        return (
-            torch.stack((fine_loss, family_loss, basic_loss), dim=1),
-            torch.stack((fine_mask, family_mask, basic_mask), dim=1),
+        classification_losses = torch.stack(
+            (fine_loss, family_loss, basic_loss), dim=1
         )
+        # Keep consistency evidence separate from supervised classification.
+        # Species receives the mean of both taxonomy checks because its
+        # distribution induces both parent predictions; Family and Order keep
+        # their own consistency terms.  This lets the bilevel router calibrate
+        # the two signals independently instead of allowing CE scale to drown
+        # out the relation branch's hierarchy benefit.
+        consistency_losses = torch.stack(
+            (
+                0.5 * (family_consistency + order_consistency),
+                family_consistency,
+                order_consistency,
+            ),
+            dim=1,
+        )
+        losses = (
+            classification_losses
+            + float(consistency_weight) * consistency_losses
+        )
+        return {
+            'losses': losses,
+            'mask': torch.stack((fine_mask, family_mask, basic_mask), dim=1),
+            'classification_losses': classification_losses,
+            'consistency_losses': consistency_losses,
+        }
 
     def bilevel_task_loss(
         self, state, adapter_params, reference, fine_targets, sub_targets,
@@ -418,10 +437,12 @@ class HierVisionTransformer(VisionTransformer):
         family_weight=0.5, basic_weight=0.5,
     ):
         """Backward-compatible reduced hierarchical virtual evaluator."""
-        losses, mask = self.bilevel_task_losses(
+        task_output = self.bilevel_task_losses(
             state, adapter_params, reference, fine_targets, sub_targets,
             basic_targets, leaf_index, sub_index,
         )
+        losses = task_output['losses']
+        mask = task_output['mask']
         weights = losses.new_tensor((fine_weight, family_weight, basic_weight))
         task_means = (
             (losses * mask).sum(dim=0) / mask.sum(dim=0).clamp_min(1.0)
