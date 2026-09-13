@@ -201,6 +201,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                         build_relations=True,
                     )
                 query_meta_state = query_out[-1]
+                # V8.6 label-free Species trust-region reference.  The
+                # probability is produced by the unmodified query model and
+                # is stopped before any virtual branch is evaluated.
+                query_species_anchor_prob = F.softmax(
+                    query_out[0].detach().float(), dim=-1
+                )
 
             # Meta step: exact hypergradient of the one-step unrolled objective.
             # Only phi (the policy) is updated; theta/psi are untouched here.
@@ -218,6 +224,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                         species_to_family=species_to_family,
                         species_to_order=species_to_order,
                         consistency_weight=args.meta_consistency_weight,
+                        species_anchor_prob=query_species_anchor_prob,
                     )
                 return core_model.bilevel_task_loss(
                     state,
@@ -263,6 +270,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     safe_confidence_budget=args.meta_safe_confidence_budget,
                     consistency_credit_weight=(
                         args.meta_consistency_credit_weight
+                    ),
+                    counterfactual_compose=args.counterfactual_compose,
+                    relation_residual_inner_scale=(
+                        args.meta_relation_residual_inner_scale
+                    ),
+                    species_no_regret_margin=(
+                        args.meta_species_no_regret_margin
+                    ),
+                    species_anchor_kl_margin=(
+                        args.meta_species_anchor_kl_margin
                     ),
                     safe_gate=not args.no_meta_safe_gate,
                     return_aux=True,
@@ -313,6 +330,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                 ),
                 safe_route_budget=args.meta_safe_route_budget,
                 safe_confidence_scale=args.meta_safe_confidence_scale,
+                counterfactual_compose=args.counterfactual_compose,
             )
             meta_stats.update(real_stats)
 
