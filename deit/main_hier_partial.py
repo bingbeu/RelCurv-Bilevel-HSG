@@ -278,6 +278,18 @@ def get_args_parser():
               'counterfactual route; must be between zero and one'),
     )
     parser.add_argument(
+        '--meta-safe-confidence-scale', default=1.0, type=float,
+        help=('calibrated positive gain that receives the complete non-Skip '
+              'budget; weaker gains receive a proportional budget'),
+    )
+    parser.add_argument(
+        '--no-meta-safe-confidence-budget',
+        action='store_false',
+        dest='meta_safe_confidence_budget',
+        help='restore the fixed-budget V8.3 safe route',
+    )
+    parser.set_defaults(meta_safe_confidence_budget=True)
+    parser.add_argument(
         '--no-meta-safe-gate', action='store_true',
         help='ablate positive-gain gating of the real counterfactual update',
     )
@@ -296,7 +308,7 @@ def get_args_parser():
     parser.add_argument('--router-hidden-dim', default=32, type=int)
     parser.add_argument('--router-prior', default=(0.50, 0.45, 0.05),
                         nargs=3, type=float, metavar=('SKIP', 'PART', 'REL'),
-                        help=('router prior; counterfactual V8.3 uses only the '
+                        help=('router prior; counterfactual V8.3+ uses only the '
                               'Part-to-Relation ratio'))
     parser.add_argument('--no-relation-hvp', action='store_true',
                         help='replace relation HVP by its endpoint part-curvature prior')

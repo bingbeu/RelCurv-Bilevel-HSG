@@ -1,10 +1,10 @@
-# Two-Stage Safe Counterfactual Bilevel Optimization (V8.3)
+# Confidence-Budgeted Counterfactual Bilevel Optimization (V8.4)
 
 Let `theta` denote the backbone and classifier, `psi` the shared semantic
 adapter, and `phi` the token policies plus granularity router.
 
 For a support view, local and relation policies produce `p_part` and `p_rel`.
-V8.3 does not mix their losses before the virtual update. It constructs three
+V8.4 does not mix their losses before the virtual update. It constructs three
 counterfactual adapter states:
 
 ```text
@@ -27,7 +27,7 @@ The legacy-compatible router first produces a per-example `3 x 3` matrix:
 R_phi[x,t,b] = P(branch=b | example=x, hierarchy-level=t)
 ```
 
-V8.3 does not allow the learned Skip logit to compete with semantic learning.
+V8.4 does not allow the learned Skip logit to compete with semantic learning.
 It removes Skip and forms the conditional Part/Relation route
 
 ```text
@@ -45,7 +45,7 @@ D[x,t,b] = (J[x,t,b] - J[x,t,skip])
            / max(abs(J[x,t,skip]), 1e-3)
 ```
 
-V8.3 adds the positive-gain margin to non-skip branches and calibrates the
+V8.4 adds the positive-gain margin to non-skip branches and calibrates the
 signal independently inside every example and hierarchy level:
 
 ```text
@@ -60,16 +60,25 @@ For each example and level, stopped positive-gain evidence defines eligibility
 E[x,t,b] = 1[D[x,t,b] + safe_margin < 0], b in {part, relation}
 ```
 
-The conditional router is masked and renormalized over eligible branches. With
-`beta = --meta-safe-route-budget`, the route used by both the outer solver and
-real semantic loss is
+The conditional router is masked and renormalized over eligible branches. V8.4
+defines the strongest stopped calibrated positive gain and an effective budget
+
+```text
+confidence[x,t] = max_b relu(-D_cal[x,t,b])
+beta_eff[x,t] = beta_max * clip(confidence[x,t] / confidence_scale, 0, 1)
+```
+
+where `beta_max = --meta-safe-route-budget` and `confidence_scale =
+--meta-safe-confidence-scale`. The route used by both the outer solver and real
+semantic loss is
 
 ```text
 if no semantic branch is eligible:
     R_safe[x,t,:] = [1, 0, 0]
 else:
-    R_safe[x,t,skip] = 1 - beta
-    R_safe[x,t,{part,relation}] = beta * normalize(C_phi[x,t,:] * E[x,t,:])
+    R_safe[x,t,skip] = 1 - beta_eff[x,t]
+    R_safe[x,t,{part,relation}] = beta_eff[x,t]
+                                     * normalize(C_phi[x,t,:] * E[x,t,:])
 ```
 
 The upper-level task objective is the expected counterfactual query loss plus
@@ -89,12 +98,15 @@ only task losses measured after the separate virtual updates. Thus the policy
 is rewarded for producing and selecting an update that improves post-update
 query performance, not for selecting items with an already small error. Calibration
 preserves branch ordering, while two-stage routing makes Skip a safety outcome
-instead of a learnable escape. The mask `M` follows the official free-grained
-label protocol. `--no-meta-router-regret-normalization` restores raw regret.
+instead of a learnable escape. Confidence is detached, so it controls the safe
+real-update magnitude without becoming a shortcut around the hypergradient.
+The mask `M` follows the official free-grained label protocol.
+`--no-meta-router-regret-normalization` restores raw router regret without
+changing the confidence normalization.
 
 ## Safe real update
 
-For each example, hierarchy level and non-skip branch, V8.3 computes the stopped
+For each example, hierarchy level and non-skip branch, V8.4 computes the stopped
 relative query improvement
 
 ```text
@@ -103,11 +115,12 @@ A[t,b] = (J[t,skip] - J[t,b]) / max(abs(J[t,skip]), 1e-3)
 
 Only branches with `A[t,b] > --meta-safe-improvement-margin` may contribute to
 the real adapter loss. If at least one branch is accepted, the conditional
-Part/Relation route distributes exactly `--meta-safe-route-budget` total mass;
-the remaining mass belongs to Skip. The eligibility mask is detached, while
+Part/Relation route distributes at most `--meta-safe-route-budget`; weak gains
+receive proportionally less. Eligibility and confidence are detached, while
 the conditional router and item policies are still optimized through the
-post-update query objective. `--no-meta-safe-gate` treats both semantic branches
-as eligible but retains the bounded budget.
+post-update query objective. `--no-meta-safe-confidence-budget` restores the
+fixed V8.3 budget. `--no-meta-safe-gate` treats both semantic branches as
+eligible and uses the full bounded budget.
 
 Part and Relation raw gradients are normalized separately over the complete
 shared-adapter parameter vector. Consequently, `--meta-inner-lr` is the L2 norm
@@ -160,14 +173,15 @@ is computed in FP32 and stopped before entering the policy.
 2. Part-only V7 (`--meta-scope part`).
 3. Fixed hybrid (`--meta-scope hybrid`).
 4. V7 pre-mixed routing (`--meta-scope adaptive`).
-5. V8.3 two-stage safe counterfactual routing (`--meta-scope counterfactual`).
-6. V8.3 without the consistency surrogate (`--meta-consistency-weight 0`).
-7. V8.3 without relation HVP (`--no-relation-hvp`).
+5. V8.4 confidence-budgeted routing (`--meta-scope counterfactual`).
+6. V8.4 without the consistency surrogate (`--meta-consistency-weight 0`).
+7. V8.4 without relation HVP (`--no-relation-hvp`).
 8. Uniform item policies (`--meta-reference-mix 0`).
 9. Task-free outer objective (`--meta-task-weight 0`) as a diagnostic only.
 10. Raw virtual gradients (`--no-meta-inner-grad-normalization`).
 11. Unsafe real update (`--no-meta-safe-gate`).
 12. Raw V8.1 router regret (`--no-meta-router-regret-normalization`).
 13. Unbounded semantic route (`--meta-safe-route-budget 1.0`).
+14. Fixed V8.3 budget (`--no-meta-safe-confidence-budget`).
 
 Use identical initialization, schedules and paired seeds for every comparison.

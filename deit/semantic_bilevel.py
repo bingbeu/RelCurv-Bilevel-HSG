@@ -12,9 +12,9 @@ Only the post-update outer objective updates ``phi``.
 V8 adds a branch-counterfactual, all-level route.  Skip, part and relation
 updates are unrolled independently and evaluated on Species, Family and Order
 losses.  V8.2 calibrates branch regret inside every example and hierarchy
-level.  V8.3 separates safety from semantic selection: stopped positive-gain
-evidence decides Skip, while the differentiable router chooses only between
-eligible Part and Relation updates under a bounded real-update budget.
+level. V8.3 separates safety from semantic selection. V8.4 additionally makes
+the bounded real-update budget proportional to stopped calibrated gain, so a
+barely positive branch cannot receive the same update as a reliable one.
 """
 
 import math
@@ -761,20 +761,28 @@ class BilevelSemanticController(nn.Module):
         learned_route: torch.Tensor,
         branch_eligibility: Optional[torch.Tensor],
         non_skip_budget: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        branch_confidence: Optional[torch.Tensor] = None,
+        confidence_scale: float = 1.0,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         """Let safety decide Skip and learn only Part-versus-Relation.
 
         ``learned_route`` keeps the legacy Skip/Part/Relation shape, but its
         Skip logit is intentionally removed by conditioning on the two
         semantic branches.  Eligibility is stopped counterfactual evidence.
-        Whenever at least one branch is eligible, exactly ``non_skip_budget``
-        probability is assigned across eligible semantic branches; otherwise
-        the route is pure Skip.
+        V8.4 scales ``non_skip_budget`` continuously by the strongest stopped,
+        calibrated positive gain. Marginal improvements therefore receive a
+        small real update, while confidence at or above ``confidence_scale``
+        receives the complete budget. Without confidence evidence this helper
+        retains the V8.3 fixed-budget behavior for unsafe ablations.
         """
         if learned_route.size(-1) != 3:
             raise ValueError("two-stage route requires Skip/Part/Relation logits")
         if not 0.0 <= float(non_skip_budget) <= 1.0:
             raise ValueError("counterfactual non-Skip budget must be in [0, 1]")
+        if confidence_scale <= 0:
+            raise ValueError("counterfactual confidence scale must be positive")
 
         semantic_route = learned_route[..., 1:]
         conditional_route = semantic_route / semantic_route.sum(
@@ -794,17 +802,46 @@ class BilevelSemanticController(nn.Module):
                 dtype=conditional_route.dtype,
             )
 
+        if branch_confidence is None:
+            confidence_fraction = torch.ones_like(
+                conditional_route[..., :1]
+            )
+        else:
+            if tuple(branch_confidence.shape) != tuple(conditional_route.shape):
+                raise ValueError(
+                    "counterfactual branch confidence must have shape "
+                    f"{tuple(conditional_route.shape)}, got "
+                    f"{tuple(branch_confidence.shape)}"
+                )
+            confidence = branch_confidence.detach().to(
+                device=conditional_route.device,
+                dtype=conditional_route.dtype,
+            ).clamp_min(0.0)
+            strongest_confidence = (confidence * eligible).max(
+                dim=-1, keepdim=True
+            ).values
+            confidence_fraction = (
+                strongest_confidence / float(confidence_scale)
+            ).clamp(min=0.0, max=1.0)
+
         eligible_route = conditional_route * eligible
         eligible_mass = eligible_route.sum(dim=-1, keepdim=True)
         has_eligible = eligible_mass.gt(0.0)
         eligible_route = eligible_route / eligible_mass.clamp_min(1.0e-8)
-        semantic_budget = has_eligible.to(conditional_route.dtype) * float(
-            non_skip_budget
+        semantic_budget = (
+            has_eligible.to(conditional_route.dtype)
+            * float(non_skip_budget)
+            * confidence_fraction
         )
         safe_non_skip = semantic_budget * eligible_route
         safe_skip = 1.0 - safe_non_skip.sum(dim=-1, keepdim=True)
         safe_route = torch.cat((safe_skip, safe_non_skip), dim=-1)
-        return safe_route, conditional_route, has_eligible.squeeze(-1)
+        return (
+            safe_route,
+            conditional_route,
+            has_eligible.squeeze(-1),
+            semantic_budget.squeeze(-1),
+        )
 
     @staticmethod
     def _task_output(
@@ -883,6 +920,8 @@ class BilevelSemanticController(nn.Module):
         normalize_router_regret: bool,
         router_regret_floor: float,
         safe_route_budget: float,
+        safe_confidence_scale: float,
+        safe_confidence_budget: bool,
         safe_gate: bool,
     ):
         """Three virtual branches evaluated independently at all three levels."""
@@ -902,6 +941,8 @@ class BilevelSemanticController(nn.Module):
             raise ValueError("router regret floor must be positive")
         if not 0.0 <= float(safe_route_budget) <= 1.0:
             raise ValueError("safe route budget must be in [0, 1]")
+        if safe_confidence_scale <= 0:
+            raise ValueError("safe confidence scale must be positive")
 
         level_weights = torch.as_tensor(
             task_level_weights, dtype=torch.float32,
@@ -1050,22 +1091,44 @@ class BilevelSemanticController(nn.Module):
             scale_floor=router_regret_floor,
             normalize=normalize_router_regret,
         )
+        if normalize_router_regret:
+            confidence_regret = calibrated_regret
+        else:
+            confidence_regret, _ = self._calibrate_counterfactual_regret(
+                relative_regret,
+                improvement_margin=safe_improvement_margin,
+                scale_floor=router_regret_floor,
+                normalize=True,
+            )
         # The stopped gate owns the Skip decision.  The learned router is
         # conditioned on semantic updates and can only choose Part versus
         # Relation.  This prevents expected-regret training from escaping into
         # the global all-Skip solution observed in V8.1/V8.2.
         relative_gain = -relative_regret.detach()[:, :, 1:]
+        branch_confidence = (
+            -confidence_regret.detach()[:, :, 1:]
+        ).clamp_min(0.0)
         branch_eligibility = (
             (relative_gain > float(safe_improvement_margin))
             & task_mask.bool().unsqueeze(-1)
         )
         route_eligibility = branch_eligibility if safe_gate else None
-        two_stage_route, conditional_route, has_eligible = (
-            self._two_stage_counterfactual_route(
-                route,
-                route_eligibility,
-                non_skip_budget=safe_route_budget,
-            )
+        route_confidence = (
+            branch_confidence
+            if safe_gate and safe_confidence_budget
+            else None
+        )
+        (
+            two_stage_route,
+            conditional_route,
+            has_eligible,
+            effective_budget,
+        ) = self._two_stage_counterfactual_route(
+            route,
+            route_eligibility,
+            non_skip_budget=safe_route_budget,
+            branch_confidence=route_confidence,
+            confidence_scale=safe_confidence_scale,
         )
         best_branch = calibrated_regret.detach().argmin(dim=-1)
 
@@ -1160,6 +1223,12 @@ class BilevelSemanticController(nn.Module):
             "two_stage_active_rate": (
                 has_eligible.float() * task_mask
             ).sum().div(route_denominator).detach(),
+            "two_stage_effective_budget": (
+                effective_budget * task_mask
+            ).sum().div(route_denominator).detach(),
+            "two_stage_gain_confidence": (
+                branch_confidence.max(dim=-1).values * task_mask
+            ).sum().div(route_denominator).detach(),
         }
         task_names = AdaptiveGranularityRouter.TASK_NAMES
         for task_idx, task_name in enumerate(task_names):
@@ -1202,6 +1271,12 @@ class BilevelSemanticController(nn.Module):
                 f"two_stage_{task_name}_active_rate": masked_level_mean(
                     has_eligible.float(), task_idx
                 ).detach(),
+                f"two_stage_{task_name}_effective_budget": masked_level_mean(
+                    effective_budget, task_idx
+                ).detach(),
+                f"two_stage_{task_name}_gain_confidence": masked_level_mean(
+                    branch_confidence.max(dim=-1).values, task_idx
+                ).detach(),
             })
             for branch_idx, branch_name in enumerate(
                 ("skip", "part", "relation")
@@ -1223,7 +1298,10 @@ class BilevelSemanticController(nn.Module):
         stats.update(route_stats)
         stats.update({"part_" + key: value for key, value in part_policy_stats.items()})
         stats.update({"rel_" + key: value for key, value in relation_policy_stats.items()})
-        return meta_loss, stats, {"branch_eligibility": branch_eligibility}
+        return meta_loss, stats, {
+            "branch_eligibility": branch_eligibility,
+            "branch_confidence": branch_confidence,
+        }
 
     def meta_objective(
         self, support: Dict[str, torch.Tensor], query: Dict[str, torch.Tensor],
@@ -1241,6 +1319,8 @@ class BilevelSemanticController(nn.Module):
         normalize_router_regret: bool = False,
         router_regret_floor: float = 1.0e-4,
         safe_route_budget: float = 0.05,
+        safe_confidence_scale: float = 1.0,
+        safe_confidence_budget: bool = True,
         safe_gate: bool = True,
         return_aux: bool = False,
     ):
@@ -1270,6 +1350,8 @@ class BilevelSemanticController(nn.Module):
                 normalize_router_regret=normalize_router_regret,
                 router_regret_floor=router_regret_floor,
                 safe_route_budget=safe_route_budget,
+                safe_confidence_scale=safe_confidence_scale,
+                safe_confidence_budget=safe_confidence_budget,
                 safe_gate=safe_gate,
             )
             return result if return_aux else result[:2]
@@ -1429,7 +1511,9 @@ class BilevelSemanticController(nn.Module):
         relation_weight: float = 1.0,
         task_level_weights: Tuple[float, float, float] = (1.0, 0.5, 0.5),
         branch_eligibility: Optional[torch.Tensor] = None,
+        branch_confidence: Optional[torch.Tensor] = None,
         safe_route_budget: float = 0.05,
+        safe_confidence_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Real shared-adapter loss with every learned policy detached."""
         self._check_scope(scope)
@@ -1488,12 +1572,17 @@ class BilevelSemanticController(nn.Module):
                 part_error.detach(), relation_error.detach(),
                 state["curvature"].detach(), relation_curvature.detach(),
             )
-            task_route, conditional_route, has_eligible = (
-                self._two_stage_counterfactual_route(
-                    task_route,
-                    branch_eligibility,
-                    non_skip_budget=safe_route_budget,
-                )
+            (
+                task_route,
+                conditional_route,
+                has_eligible,
+                effective_budget,
+            ) = self._two_stage_counterfactual_route(
+                task_route,
+                branch_eligibility,
+                non_skip_budget=safe_route_budget,
+                branch_confidence=branch_confidence,
+                confidence_scale=safe_confidence_scale,
             )
             safe_entropy = -(
                 task_route * task_route.clamp_min(1.0e-8).log()
@@ -1504,6 +1593,7 @@ class BilevelSemanticController(nn.Module):
                 "safe_route_relation": task_route[:, :, 2].mean().detach(),
                 "safe_route_entropy": safe_entropy.mean().detach(),
                 "safe_route_active_rate": has_eligible.float().mean().detach(),
+                "safe_route_effective_budget": effective_budget.mean().detach(),
                 "conditional_route_part": (
                     conditional_route[:, :, 0].mean().detach()
                 ),
@@ -1526,6 +1616,9 @@ class BilevelSemanticController(nn.Module):
                     ),
                     f"safe_route_{task_name}_active_rate": (
                         has_eligible[:, task_idx].float().mean().detach()
+                    ),
+                    f"safe_route_{task_name}_effective_budget": (
+                        effective_budget[:, task_idx].mean().detach()
                     ),
                     f"conditional_route_{task_name}_part": (
                         conditional_route[:, task_idx, 0].mean().detach()

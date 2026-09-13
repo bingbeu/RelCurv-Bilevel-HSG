@@ -259,6 +259,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     ),
                     router_regret_floor=args.meta_router_regret_floor,
                     safe_route_budget=args.meta_safe_route_budget,
+                    safe_confidence_scale=args.meta_safe_confidence_scale,
+                    safe_confidence_budget=args.meta_safe_confidence_budget,
                     safe_gate=not args.no_meta_safe_gate,
                     return_aux=True,
                 )
@@ -299,7 +301,15 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     None if args.no_meta_safe_gate
                     else meta_aux.get('branch_eligibility')
                 ),
+                branch_confidence=(
+                    None if (
+                        args.no_meta_safe_gate
+                        or not args.meta_safe_confidence_budget
+                    )
+                    else meta_aux.get('branch_confidence')
+                ),
                 safe_route_budget=args.meta_safe_route_budget,
+                safe_confidence_scale=args.meta_safe_confidence_scale,
             )
             meta_stats.update(real_stats)
 
