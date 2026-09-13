@@ -248,6 +248,28 @@ def get_args_parser():
                                  'counterfactual'],
                         help=('counterfactual independently evaluates skip/local/relation '
                               'updates for Species, Family and Order'))
+    parser.add_argument(
+        '--counterfactual-compose', default='competitive',
+        choices=['competitive', 'residual'],
+        help=('competitive reproduces V8.5 skip/part/relation branches; '
+              'residual evaluates skip/part/(part+relation) so Relation '
+              'cannot replace the Part anchor'),
+    )
+    parser.add_argument(
+        '--meta-relation-residual-inner-scale', default=0.5, type=float,
+        help=('Relation virtual-step scale relative to meta-inner-lr in '
+              'counterfactual residual mode'),
+    )
+    parser.add_argument(
+        '--meta-species-no-regret-margin', default=0.01, type=float,
+        help=('maximum relative Species CE degradation allowed when adding '
+              'the Relation residual after Part'),
+    )
+    parser.add_argument(
+        '--meta-species-anchor-kl-margin', default=0.01, type=float,
+        help=('maximum extra KL to the stopped base Species prediction '
+              'allowed for Part+Relation relative to Part'),
+    )
     parser.add_argument('--meta-relation-weight', default=1.0, type=float)
     parser.add_argument('--meta-task-weight', default=1.0, type=float)
     parser.add_argument('--meta-semantic-weight', default=0.1, type=float)
