@@ -15,7 +15,10 @@ losses.  V8.2 calibrates branch regret inside every example and hierarchy
 level. V8.3 separates safety from semantic selection. V8.4 scales the complete
 budget by confidence. V8.5 restores a fixed safe budget, uses confidence only
 for conditional Part/Relation allocation, and credits independently calibrated
-taxonomy-consistency gains in every hierarchy-level route.
+taxonomy-consistency gains in every hierarchy-level route. V8.6 optionally
+anchors every semantic update on Part and treats Relation as a guarded residual,
+so relation consistency credit cannot replace a classification-helpful Part
+update.
 """
 
 import math
@@ -839,11 +842,36 @@ class BilevelSemanticController(nn.Module):
         )
 
     @staticmethod
+    def _real_alignment_route_weights(
+        route: torch.Tensor,
+        counterfactual_compose: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Map counterfactual branches to executable alignment weights.
+
+        In competitive mode Part and Relation are independent alternatives.
+        In residual mode the Relation branch is ``Part -> Relation``, so its
+        probability contributes to the Part anchor as well as the Relation
+        residual.  This is the key invariant that prevents relation credit
+        from stealing useful Part supervision on Aircraft.
+        """
+        if route.size(-1) != 3:
+            raise ValueError("counterfactual route must contain three branches")
+        if counterfactual_compose not in ("competitive", "residual"):
+            raise ValueError(
+                "counterfactual compose must be 'competitive' or 'residual'"
+            )
+        part_weight = route[..., 1]
+        relation_weight = route[..., 2]
+        if counterfactual_compose == "residual":
+            part_weight = part_weight + relation_weight
+        return part_weight, relation_weight
+
+    @staticmethod
     def _task_output(
         value,
         batch_size: int,
     ) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
         """Validate an all-level outer evaluator and expose route credits.
 
@@ -858,10 +886,12 @@ class BilevelSemanticController(nn.Module):
             mask = value.get("mask")
             classification_losses = value.get("classification_losses", losses)
             consistency_losses = value.get("consistency_losses")
+            species_anchor_losses = value.get("species_anchor_losses")
         elif isinstance(value, (tuple, list)) and len(value) == 2:
             losses, mask = value
             classification_losses = losses
             consistency_losses = None
+            species_anchor_losses = None
         else:
             raise TypeError(
                 "counterfactual outer_task_fn must return (losses, mask) or "
@@ -890,11 +920,20 @@ class BilevelSemanticController(nn.Module):
             raise ValueError(
                 "counterfactual consistency losses must match task losses"
             )
+        if species_anchor_losses is None:
+            species_anchor_losses = losses.new_zeros(batch_size)
+        if not isinstance(species_anchor_losses, torch.Tensor):
+            raise TypeError("counterfactual species anchor losses must be a tensor")
+        if tuple(species_anchor_losses.shape) != (batch_size,):
+            raise ValueError(
+                "counterfactual species anchor losses must have shape (B,)"
+            )
         return (
             losses.float(),
             mask.to(device=losses.device, dtype=losses.dtype),
             classification_losses.float(),
             consistency_losses.float(),
+            species_anchor_losses.float(),
         )
 
     def _counterfactual_alignment(
@@ -945,6 +984,10 @@ class BilevelSemanticController(nn.Module):
         safe_confidence_scale: float,
         safe_confidence_budget: bool,
         consistency_credit_weight: float,
+        counterfactual_compose: str,
+        relation_residual_inner_scale: float,
+        species_no_regret_margin: float,
+        species_anchor_kl_margin: float,
         safe_gate: bool,
     ):
         """Three virtual branches evaluated independently at all three levels."""
@@ -968,6 +1011,16 @@ class BilevelSemanticController(nn.Module):
             raise ValueError("safe confidence scale must be positive")
         if consistency_credit_weight < 0:
             raise ValueError("consistency credit weight must be nonnegative")
+        if counterfactual_compose not in ("competitive", "residual"):
+            raise ValueError(
+                "counterfactual compose must be 'competitive' or 'residual'"
+            )
+        if relation_residual_inner_scale <= 0:
+            raise ValueError("relation residual inner scale must be positive")
+        if species_no_regret_margin < 0:
+            raise ValueError("species no-regret margin must be nonnegative")
+        if species_anchor_kl_margin < 0:
+            raise ValueError("species anchor KL margin must be nonnegative")
 
         level_weights = torch.as_tensor(
             task_level_weights, dtype=torch.float32,
@@ -996,15 +1049,51 @@ class BilevelSemanticController(nn.Module):
         part_kl = self._policy_kl(part_policy)
 
         support_relation = support["relation_state"]
-        relation_tokens = self.relation_encoder.visual_relations(
+        base_relation_tokens = self.relation_encoder.visual_relations(
             support_adapted,
             support_relation["part_attn"].detach().float(),
         )[0]
+        base_relation_error = self.relation_alignment_error(
+            base_relation_tokens,
+            support_relation["target_semantics"].detach().float(),
+        )
+        relation_curvature = support_relation["curvature"].detach().float()
+
+        # Part is always unrolled from the base adapter.  In competitive mode
+        # Relation is also unrolled from the base (exact V8.5 behavior).  In
+        # residual mode it is unrolled from the Part state and therefore
+        # measures only the incremental value of adding Relation after Part.
+        base_values = tuple(base_params.values())
+        part_grads = torch.autograd.grad(
+            part_inner_per_example.mean(), base_values,
+            create_graph=True, retain_graph=True, allow_unused=False,
+        )
+        part_fast_params, part_grad_norm, part_step_norm = (
+            self._counterfactual_fast_params(
+                base_params, part_grads, inner_lr, normalize_inner_grad
+            )
+        )
+        if counterfactual_compose == "residual":
+            relation_source_params = part_fast_params
+            relation_source_adapted = self.adapt_parts(
+                support_tokens, relation_source_params
+            )
+            relation_tokens = self.relation_encoder.visual_relations(
+                relation_source_adapted,
+                support_relation["part_attn"].detach().float(),
+            )[0]
+            relation_step_lr = (
+                float(inner_lr) * float(relation_residual_inner_scale)
+            )
+        else:
+            relation_source_params = base_params
+            relation_tokens = base_relation_tokens
+            relation_step_lr = float(inner_lr)
+
         relation_error = self.relation_alignment_error(
             relation_tokens,
             support_relation["target_semantics"].detach().float(),
         )
-        relation_curvature = support_relation["curvature"].detach().float()
         relation_policy, relation_policy_stats = self.relation_policy(
             relation_tokens.detach(),
             support_relation["policy_semantics"].detach().float(),
@@ -1014,26 +1103,17 @@ class BilevelSemanticController(nn.Module):
             self.num_relations * relation_policy * relation_error
         ).mean(dim=1)
         relation_kl = self._policy_kl(relation_policy)
-
-        # Each update is unrolled separately.  No route probability is allowed
-        # to mix the inner losses before their causal effect is observed.
-        base_values = tuple(base_params.values())
-        part_grads = torch.autograd.grad(
-            part_inner_per_example.mean(), base_values,
-            create_graph=True, retain_graph=True, allow_unused=False,
-        )
         relation_grads = torch.autograd.grad(
             float(relation_weight) * relation_inner_per_example.mean(),
-            base_values, create_graph=True, allow_unused=False,
-        )
-        part_fast_params, part_grad_norm, part_step_norm = (
-            self._counterfactual_fast_params(
-                base_params, part_grads, inner_lr, normalize_inner_grad
-            )
+            tuple(relation_source_params.values()),
+            create_graph=True, allow_unused=False,
         )
         relation_fast_params, relation_grad_norm, relation_step_norm = (
             self._counterfactual_fast_params(
-                base_params, relation_grads, inner_lr, normalize_inner_grad
+                relation_source_params,
+                relation_grads,
+                relation_step_lr,
+                normalize_inner_grad,
             )
         )
         branch_params = (
@@ -1044,7 +1124,7 @@ class BilevelSemanticController(nn.Module):
 
         route, route_stats = self.router(
             part_error,
-            relation_error,
+            base_relation_error,
             support_curvature,
             relation_curvature,
         )
@@ -1076,6 +1156,7 @@ class BilevelSemanticController(nn.Module):
         task_branches = []
         classification_branches = []
         consistency_branches = []
+        species_anchor_branches = []
         align_branches = []
         task_mask = None
         batch_size = support_tokens.size(0)
@@ -1085,6 +1166,7 @@ class BilevelSemanticController(nn.Module):
                 branch_mask,
                 classification_losses,
                 consistency_losses,
+                species_anchor_losses,
             ) = self._task_output(
                 outer_task_fn(query, params, q_part), batch_size
             )
@@ -1095,6 +1177,7 @@ class BilevelSemanticController(nn.Module):
             task_branches.append(task_losses)
             classification_branches.append(classification_losses)
             consistency_branches.append(consistency_losses)
+            species_anchor_branches.append(species_anchor_losses)
             align_branches.append(self._counterfactual_alignment(
                 query, params, q_part, q_relation, relation_weight
             ))
@@ -1106,6 +1189,9 @@ class BilevelSemanticController(nn.Module):
         )
         branch_consistency_loss = torch.stack(
             consistency_branches, dim=-1
+        )
+        branch_species_anchor_loss = torch.stack(
+            species_anchor_branches, dim=-1
         )
         branch_align_loss = torch.stack(align_branches, dim=-1)
         weighted_mask = task_mask * level_weights.view(1, 3)
@@ -1122,16 +1208,36 @@ class BilevelSemanticController(nn.Module):
         # consistency credit; otherwise CE can hide a relation update that
         # improves Species/Family/Order agreement.
         skip_classification = branch_classification_loss[:, :, 0].detach()
+        skip_consistency = branch_consistency_loss[:, :, 0].detach()
+        if counterfactual_compose == "residual":
+            classification_baseline = torch.stack(
+                (
+                    skip_classification,
+                    skip_classification,
+                    branch_classification_loss[:, :, 1].detach(),
+                ),
+                dim=-1,
+            )
+            consistency_baseline = torch.stack(
+                (
+                    skip_consistency,
+                    skip_consistency,
+                    branch_consistency_loss[:, :, 1].detach(),
+                ),
+                dim=-1,
+            )
+        else:
+            classification_baseline = skip_classification.unsqueeze(-1)
+            consistency_baseline = skip_consistency.unsqueeze(-1)
         classification_relative_regret = (
-            branch_classification_loss - skip_classification.unsqueeze(-1)
-        ) / skip_classification.abs().unsqueeze(-1).clamp_min(1.0e-3)
+            branch_classification_loss - classification_baseline
+        ) / classification_baseline.abs().clamp_min(1.0e-3)
         classification_relative_regret = classification_relative_regret.clamp(
             min=-10.0, max=10.0
         )
-        skip_consistency = branch_consistency_loss[:, :, 0].detach()
         consistency_relative_regret = (
-            branch_consistency_loss - skip_consistency.unsqueeze(-1)
-        ) / skip_consistency.abs().unsqueeze(-1).clamp_min(1.0e-3)
+            branch_consistency_loss - consistency_baseline
+        ) / consistency_baseline.abs().clamp_min(1.0e-3)
         consistency_relative_regret = consistency_relative_regret.clamp(
             min=-10.0, max=10.0
         )
@@ -1204,6 +1310,41 @@ class BilevelSemanticController(nn.Module):
             (combined_gain > 0.0)
             & task_mask.bool().unsqueeze(-1)
         )
+        species_no_regret_guard = torch.ones(
+            batch_size, dtype=torch.bool, device=task_mask.device
+        )
+        species_supervised_guard = species_no_regret_guard
+        species_anchor_guard = species_no_regret_guard
+        if counterfactual_compose == "residual":
+            # The residual branch is admissible only on top of a safe Part
+            # branch and may not materially degrade Species relative to Part.
+            # Where a Species label is unavailable, stopped KL to the base
+            # prediction supplies a label-free trust-region guard.
+            species_available = task_mask[:, 0].bool()
+            part_species = branch_classification_loss[:, 0, 1].detach()
+            residual_species = branch_classification_loss[:, 0, 2].detach()
+            species_relative_delta = (
+                residual_species - part_species
+            ) / part_species.abs().clamp_min(1.0e-3)
+            species_supervised_guard = (
+                (~species_available)
+                | (species_relative_delta <= float(species_no_regret_margin))
+            )
+            species_anchor_delta = (
+                branch_species_anchor_loss[:, 2].detach()
+                - branch_species_anchor_loss[:, 1].detach()
+            )
+            species_anchor_guard = (
+                species_anchor_delta <= float(species_anchor_kl_margin)
+            )
+            species_no_regret_guard = (
+                species_supervised_guard & species_anchor_guard
+            )
+            branch_eligibility[:, :, 1] = (
+                branch_eligibility[:, :, 1]
+                & branch_eligibility[:, :, 0]
+                & species_no_regret_guard.unsqueeze(1)
+            )
         route_eligibility = branch_eligibility if safe_gate else None
         route_confidence = (
             branch_confidence
@@ -1301,6 +1442,21 @@ class BilevelSemanticController(nn.Module):
             "meta_router_consistency_credit_weight": calibrated_regret.new_tensor(
                 float(consistency_credit_weight)
             ).detach(),
+            "counterfactual_residual_mode": calibrated_regret.new_tensor(
+                float(counterfactual_compose == "residual")
+            ).detach(),
+            "meta_relation_residual_inner_scale": calibrated_regret.new_tensor(
+                float(relation_residual_inner_scale)
+            ).detach(),
+            "meta_species_no_regret_accept_rate": (
+                species_no_regret_guard.float().mean().detach()
+            ),
+            "meta_species_supervised_guard_rate": (
+                species_supervised_guard.float().mean().detach()
+            ),
+            "meta_species_anchor_guard_rate": (
+                species_anchor_guard.float().mean().detach()
+            ),
             "meta_router_calibrated_abs": (
                 calibrated_regret.detach().abs().mean(dim=-1) * task_mask
             ).sum().div(task_mask.sum().clamp_min(1.0)).detach(),
@@ -1364,17 +1520,26 @@ class BilevelSemanticController(nn.Module):
                 f"meta_{task_name}_relation_improvement": (
                     skip_value - relation_value
                 ).detach(),
+                f"meta_{task_name}_relation_incremental_improvement": (
+                    part_value - relation_value
+                ).detach(),
                 f"meta_{task_name}_part_classification_improvement": (
                     skip_classification_value - part_classification_value
                 ).detach(),
                 f"meta_{task_name}_relation_classification_improvement": (
                     skip_classification_value - relation_classification_value
                 ).detach(),
+                f"meta_{task_name}_relation_incremental_classification_improvement": (
+                    part_classification_value - relation_classification_value
+                ).detach(),
                 f"meta_{task_name}_part_consistency_improvement": (
                     skip_consistency_value - part_consistency_value
                 ).detach(),
                 f"meta_{task_name}_relation_consistency_improvement": (
                     skip_consistency_value - relation_consistency_value
+                ).detach(),
+                f"meta_{task_name}_relation_incremental_consistency_improvement": (
+                    part_consistency_value - relation_consistency_value
                 ).detach(),
                 f"safe_{task_name}_part_accept_rate": (
                     branch_eligibility[:, task_idx, 0].float()
@@ -1443,17 +1608,26 @@ class BilevelSemanticController(nn.Module):
             "meta_relation_task_improvement": (
                 task_before - relation_task
             ).detach(),
+            "meta_relation_incremental_task_improvement": (
+                part_task - relation_task
+            ).detach(),
             "meta_part_classification_improvement": (
                 classification_before - part_classification
             ).detach(),
             "meta_relation_classification_improvement": (
                 classification_before - relation_classification
             ).detach(),
+            "meta_relation_incremental_classification_improvement": (
+                part_classification - relation_classification
+            ).detach(),
             "meta_part_consistency_improvement": (
                 consistency_before - part_consistency
             ).detach(),
             "meta_relation_consistency_improvement": (
                 consistency_before - relation_consistency
+            ).detach(),
+            "meta_relation_incremental_consistency_improvement": (
+                part_consistency - relation_consistency
             ).detach(),
         })
         stats.update(route_stats)
@@ -1462,6 +1636,7 @@ class BilevelSemanticController(nn.Module):
         return meta_loss, stats, {
             "branch_eligibility": branch_eligibility,
             "branch_confidence": branch_confidence,
+            "species_no_regret_guard": species_no_regret_guard,
         }
 
     def meta_objective(
@@ -1483,6 +1658,10 @@ class BilevelSemanticController(nn.Module):
         safe_confidence_scale: float = 1.0,
         safe_confidence_budget: bool = True,
         consistency_credit_weight: float = 0.25,
+        counterfactual_compose: str = "competitive",
+        relation_residual_inner_scale: float = 0.5,
+        species_no_regret_margin: float = 0.01,
+        species_anchor_kl_margin: float = 0.01,
         safe_gate: bool = True,
         return_aux: bool = False,
     ):
@@ -1515,6 +1694,10 @@ class BilevelSemanticController(nn.Module):
                 safe_confidence_scale=safe_confidence_scale,
                 safe_confidence_budget=safe_confidence_budget,
                 consistency_credit_weight=consistency_credit_weight,
+                counterfactual_compose=counterfactual_compose,
+                relation_residual_inner_scale=relation_residual_inner_scale,
+                species_no_regret_margin=species_no_regret_margin,
+                species_anchor_kl_margin=species_anchor_kl_margin,
                 safe_gate=safe_gate,
             )
             return result if return_aux else result[:2]
@@ -1677,6 +1860,7 @@ class BilevelSemanticController(nn.Module):
         branch_confidence: Optional[torch.Tensor] = None,
         safe_route_budget: float = 0.05,
         safe_confidence_scale: float = 1.0,
+        counterfactual_compose: str = "competitive",
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Real shared-adapter loss with every learned policy detached."""
         self._check_scope(scope)
@@ -1801,6 +1985,11 @@ class BilevelSemanticController(nn.Module):
             route = (
                 task_route * level_weights.view(1, 3, 1)
             ).sum(dim=1) / level_weights.sum().clamp_min(1.0e-8)
+            part_route_weight, relation_route_weight = (
+                self._real_alignment_route_weights(
+                    route, counterfactual_compose
+                )
+            )
         else:
             route, route_stats = self._route(
                 scope, part_error.detach(),
@@ -1808,12 +1997,23 @@ class BilevelSemanticController(nn.Module):
                 state["curvature"].detach(),
                 relation_curvature.detach() if relation_curvature is not None else None,
             )
+            part_route_weight = route[:, 1]
+            relation_route_weight = route[:, 2]
         loss = (
-            route[:, 1].detach() * part_loss
-            + route[:, 2].detach() * float(relation_weight) * relation_loss
+            part_route_weight.detach() * part_loss
+            + relation_route_weight.detach()
+            * float(relation_weight) * relation_loss
         ).mean()
         stats: Dict[str, torch.Tensor] = {
             "meta_real_align": loss.detach(),
+            "meta_real_part_weight": part_route_weight.mean().detach(),
+            "meta_real_relation_weight": relation_route_weight.mean().detach(),
+            "meta_real_residual_mode": route.new_tensor(
+                float(
+                    scope == "counterfactual"
+                    and counterfactual_compose == "residual"
+                )
+            ).detach(),
             **route_stats,
         }
         stats.update({"part_" + key: value for key, value in part_stats.items()})
