@@ -261,6 +261,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     safe_route_budget=args.meta_safe_route_budget,
                     safe_confidence_scale=args.meta_safe_confidence_scale,
                     safe_confidence_budget=args.meta_safe_confidence_budget,
+                    consistency_credit_weight=(
+                        args.meta_consistency_credit_weight
+                    ),
                     safe_gate=not args.no_meta_safe_gate,
                     return_aux=True,
                 )
