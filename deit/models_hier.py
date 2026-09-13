@@ -311,6 +311,7 @@ class HierVisionTransformer(VisionTransformer):
         self, state, adapter_params, reference, fine_targets, sub_targets,
         basic_targets, leaf_index, sub_index, species_to_family=None,
         species_to_order=None, consistency_weight=0.0,
+        species_anchor_prob=None,
     ):
         """Per-example Species/Family/Order losses for V8 routing.
 
@@ -337,6 +338,26 @@ class HierVisionTransformer(VisionTransformer):
 
         batch_size = fine_logits.size(0)
         zero = fine_logits.new_zeros(batch_size)
+        species_anchor_loss = zero
+        if species_anchor_prob is not None:
+            species_anchor_prob = species_anchor_prob.detach().to(
+                device=fine_logits.device, dtype=fine_logits.dtype
+            )
+            if tuple(species_anchor_prob.shape) != tuple(fine_logits.shape):
+                raise ValueError(
+                    'species anchor probability must match fine logits'
+                )
+            species_anchor_prob = species_anchor_prob.clamp_min(1.0e-8)
+            species_anchor_prob = species_anchor_prob / species_anchor_prob.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1.0e-8)
+            species_anchor_loss = (
+                species_anchor_prob
+                * (
+                    species_anchor_prob.log()
+                    - F.log_softmax(fine_logits, dim=-1)
+                )
+            ).sum(dim=-1)
         fine_loss = zero
         fine_mask = zero
         if leaf_index.numel() > 0:
@@ -429,6 +450,7 @@ class HierVisionTransformer(VisionTransformer):
             'mask': torch.stack((fine_mask, family_mask, basic_mask), dim=1),
             'classification_losses': classification_losses,
             'consistency_losses': consistency_losses,
+            'species_anchor_losses': species_anchor_loss,
         }
 
     def bilevel_task_loss(
