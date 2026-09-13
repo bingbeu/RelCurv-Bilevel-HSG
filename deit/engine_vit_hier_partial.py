@@ -254,6 +254,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     router_advantage_scale=args.meta_router_advantage_scale,
                     normalize_inner_grad=args.meta_inner_grad_normalization,
                     safe_improvement_margin=args.meta_safe_improvement_margin,
+                    normalize_router_regret=(
+                        args.meta_router_regret_normalization
+                    ),
+                    router_regret_floor=args.meta_router_regret_floor,
                     return_aux=True,
                 )
             policy_params = tuple(

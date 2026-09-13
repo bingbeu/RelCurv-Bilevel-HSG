@@ -1,4 +1,4 @@
-name: Safe counterfactual bilevel V8.1 tensor tests
+name: Calibrated safe counterfactual bilevel V8.2 tensor tests
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
       - "codex/adaptive-granularity-bilevel-v7"
       - "codex/all-level-counterfactual-v8"
       - "codex/safe-counterfactual-v8-1"
+      - "codex/calibrated-counterfactual-v8-2"
   pull_request:
 
 jobs:

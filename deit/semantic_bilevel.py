@@ -11,8 +11,10 @@ Only the post-update outer objective updates ``phi``.
 
 V8 adds a branch-counterfactual, all-level route.  Skip, part and relation
 updates are unrolled independently and evaluated on Species, Family and Order
-losses.  The router therefore receives nine identifiable decisions instead of
-one gradient through a pre-mixed update.
+losses.  V8.2 additionally calibrates branch regret inside every example and
+hierarchy level, so useful subpopulations are not erased by dataset averaging.
+The router therefore receives nine identifiable, scale-stable decisions instead
+of one gradient through a pre-mixed update.
 """
 
 import math
@@ -718,6 +720,40 @@ class BilevelSemanticController(nn.Module):
         return fast_params, raw_norm, step_squared_norm.clamp_min(0.0).sqrt()
 
     @staticmethod
+    def _calibrate_counterfactual_regret(
+        relative_regret: torch.Tensor,
+        improvement_margin: float,
+        scale_floor: float,
+        normalize: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Calibrate branch evidence within each example and task level.
+
+        Skip keeps zero regret. The positive margin is added only to Part and
+        Relation, so a semantic branch must beat Skip by more than the safety
+        threshold. RMS scaling is stopped: it changes the strength, not the
+        direction, of the differentiable counterfactual signal.
+        """
+        if relative_regret.size(-1) != 3:
+            raise ValueError("counterfactual regret must contain three branches")
+        if improvement_margin < 0:
+            raise ValueError("counterfactual improvement margin must be nonnegative")
+        if scale_floor <= 0:
+            raise ValueError("counterfactual regret scale floor must be positive")
+        branch_margin = relative_regret.new_tensor(
+            (0.0, float(improvement_margin), float(improvement_margin))
+        )
+        adjusted_regret = relative_regret + branch_margin
+        regret_rms = adjusted_regret.detach().square().mean(
+            dim=-1, keepdim=True
+        ).sqrt()
+        if not normalize:
+            return adjusted_regret, regret_rms
+        calibrated = adjusted_regret / regret_rms.clamp_min(
+            float(scale_floor)
+        )
+        return calibrated, regret_rms
+
+    @staticmethod
     def _task_output(
         value,
         batch_size: int,
@@ -791,6 +827,8 @@ class BilevelSemanticController(nn.Module):
         router_advantage_scale: float,
         normalize_inner_grad: bool,
         safe_improvement_margin: float,
+        normalize_router_regret: bool,
+        router_regret_floor: float,
     ):
         """Three virtual branches evaluated independently at all three levels."""
         if not self.enable_relations:
@@ -805,6 +843,8 @@ class BilevelSemanticController(nn.Module):
             raise ValueError("router_advantage_scale must be nonnegative")
         if safe_improvement_margin < 0:
             raise ValueError("safe improvement margin must be nonnegative")
+        if router_regret_floor <= 0:
+            raise ValueError("router regret floor must be positive")
 
         level_weights = torch.as_tensor(
             task_level_weights, dtype=torch.float32,
@@ -951,7 +991,15 @@ class BilevelSemanticController(nn.Module):
             branch_task_loss - skip_task.unsqueeze(-1)
         ) / skip_task.abs().unsqueeze(-1).clamp_min(1.0e-3)
         relative_regret = relative_regret.clamp(min=-10.0, max=10.0)
-        expected_regret = (route * relative_regret).sum(dim=-1)
+        raw_expected_regret = (route * relative_regret).sum(dim=-1)
+        raw_router_objective = weighted_task_reduce(raw_expected_regret)
+        calibrated_regret, regret_rms = self._calibrate_counterfactual_regret(
+            relative_regret,
+            improvement_margin=safe_improvement_margin,
+            scale_floor=router_regret_floor,
+            normalize=normalize_router_regret,
+        )
+        expected_regret = (route * calibrated_regret).sum(dim=-1)
         router_objective = weighted_task_reduce(expected_regret)
 
         # The main-model update is allowed to use a non-skip branch only when
@@ -964,6 +1012,7 @@ class BilevelSemanticController(nn.Module):
             (relative_gain > float(safe_improvement_margin))
             & task_mask.bool().unsqueeze(-1)
         )
+        best_branch = calibrated_regret.detach().argmin(dim=-1)
 
         # Convert task-specific routes into one per-example semantic route only
         # for the auxiliary alignment evaluator.  Classification routing remains
@@ -1006,6 +1055,13 @@ class BilevelSemanticController(nn.Module):
                 task_before - outer_task
             ).detach() * 1.0e4,
             "meta_router_objective": router_objective.detach(),
+            "meta_router_raw_objective": raw_router_objective.detach(),
+            "meta_router_regret_rms": (
+                regret_rms.squeeze(-1) * task_mask
+            ).sum().div(task_mask.sum().clamp_min(1.0)).detach(),
+            "meta_router_calibrated_abs": (
+                calibrated_regret.detach().abs().mean(dim=-1) * task_mask
+            ).sum().div(task_mask.sum().clamp_min(1.0)).detach(),
             "meta_part_inner_grad_norm": part_grad_norm.detach(),
             "meta_relation_inner_grad_norm": relation_grad_norm.detach(),
             "meta_part_inner_step_norm": part_step_norm.detach(),
@@ -1039,6 +1095,15 @@ class BilevelSemanticController(nn.Module):
                     * task_mask[:, task_idx]
                 ).sum().div(task_mask[:, task_idx].sum().clamp_min(1.0)).detach(),
             })
+            for branch_idx, branch_name in enumerate(
+                ("skip", "part", "relation")
+            ):
+                stats[f"candidate_{task_name}_{branch_name}_rate"] = (
+                    best_branch[:, task_idx].eq(branch_idx).float()
+                    * task_mask[:, task_idx]
+                ).sum().div(
+                    task_mask[:, task_idx].sum().clamp_min(1.0)
+                ).detach()
         part_task = weighted_task_reduce(branch_task_loss[:, :, 1])
         relation_task = weighted_task_reduce(branch_task_loss[:, :, 2])
         stats.update({
@@ -1065,6 +1130,8 @@ class BilevelSemanticController(nn.Module):
         router_advantage_scale: float = 100.0,
         normalize_inner_grad: bool = False,
         safe_improvement_margin: float = 0.0,
+        normalize_router_regret: bool = False,
+        router_regret_floor: float = 1.0e-4,
         return_aux: bool = False,
     ):
         """Joint one-step inner update with a task-feedback query evaluator.
@@ -1090,6 +1157,8 @@ class BilevelSemanticController(nn.Module):
                 router_advantage_scale=router_advantage_scale,
                 normalize_inner_grad=normalize_inner_grad,
                 safe_improvement_margin=safe_improvement_margin,
+                normalize_router_regret=normalize_router_regret,
+                router_regret_floor=router_regret_floor,
             )
             return result if return_aux else result[:2]
         use_part = scope in ("part", "hybrid", "adaptive")

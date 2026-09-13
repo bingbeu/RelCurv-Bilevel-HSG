@@ -115,9 +115,11 @@ class BilevelSemanticControllerTest(unittest.TestCase):
             semantic_weight=0.1,
             kl_weight=0.0,
             router_kl_weight=0.0,
-            router_advantage_scale=10.0,
+            router_advantage_scale=1.0,
             normalize_inner_grad=True,
             safe_improvement_margin=1.0e-5,
+            normalize_router_regret=True,
+            router_regret_floor=1.0e-4,
             return_aux=True,
         )
         router_params = tuple(controller.router.parameters())
@@ -135,6 +137,11 @@ class BilevelSemanticControllerTest(unittest.TestCase):
             self.assertIn(f"meta_{task_name}_relation_improvement", stats)
         self.assertIn("meta_part_task_improvement", stats)
         self.assertIn("meta_relation_task_improvement", stats)
+        self.assertIn("meta_router_raw_objective", stats)
+        self.assertIn("meta_router_regret_rms", stats)
+        self.assertIn("candidate_species_skip_rate", stats)
+        self.assertIn("candidate_family_part_rate", stats)
+        self.assertIn("candidate_order_relation_rate", stats)
         self.assertAlmostEqual(
             stats["meta_part_inner_step_norm"].item(), 0.1, places=5
         )
@@ -187,6 +194,34 @@ class BilevelSemanticControllerTest(unittest.TestCase):
                 scope="counterfactual",
                 branch_eligibility=torch.ones(self.batch, 2),
             )
+
+    def test_counterfactual_regret_calibration_preserves_branch_order(self):
+        regret = torch.tensor([
+            [[0.0, 0.20, -0.10]],
+            [[0.0, -2.0e-5, 3.0e-5]],
+            [[0.0, -2.0e-6, -3.0e-6]],
+        ])
+        calibrated, rms = self.controller._calibrate_counterfactual_regret(
+            regret,
+            improvement_margin=1.0e-5,
+            scale_floor=1.0e-4,
+            normalize=True,
+        )
+        # Relation is best in row 0, Part clears the margin in row 1, and
+        # neither semantic branch clears the margin in row 2.
+        self.assertEqual(calibrated.argmin(dim=-1).flatten().tolist(), [2, 1, 0])
+        self.assertEqual(tuple(rms.shape), (3, 1, 1))
+        self.assertTrue(torch.isfinite(calibrated).all())
+        self.assertTrue(torch.isfinite(rms).all())
+
+        raw, _ = self.controller._calibrate_counterfactual_regret(
+            regret,
+            improvement_margin=1.0e-5,
+            scale_floor=1.0e-4,
+            normalize=False,
+        )
+        expected = regret + regret.new_tensor([0.0, 1.0e-5, 1.0e-5])
+        self.assertTrue(torch.allclose(raw, expected))
 
     def test_part_meta_gradient_and_direct_gradient_isolation(self):
         support = self._state(1, compute_hvp=False)

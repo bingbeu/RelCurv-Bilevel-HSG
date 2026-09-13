@@ -252,9 +252,21 @@ def get_args_parser():
     parser.add_argument('--meta-task-weight', default=1.0, type=float)
     parser.add_argument('--meta-semantic-weight', default=0.1, type=float)
     parser.add_argument('--meta-router-kl-weight', default=0.001, type=float)
-    parser.add_argument('--meta-router-advantage-scale', default=100.0, type=float,
+    parser.add_argument('--meta-router-advantage-scale', default=1.0, type=float,
                         help=('scale normalized post-update branch regret in the '
                               'counterfactual outer objective'))
+    parser.add_argument(
+        '--no-meta-router-regret-normalization',
+        action='store_false',
+        dest='meta_router_regret_normalization',
+        help=('use raw relative branch regret; by default regret is RMS-scaled '
+              'within every example and hierarchy level'),
+    )
+    parser.set_defaults(meta_router_regret_normalization=True)
+    parser.add_argument(
+        '--meta-router-regret-floor', default=1e-4, type=float,
+        help='noise floor for per-example counterfactual regret calibration',
+    )
     parser.add_argument(
         '--meta-safe-improvement-margin', default=1e-5, type=float,
         help=('minimum relative query-task gain required before a '
