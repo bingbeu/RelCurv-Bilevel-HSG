@@ -1,4 +1,4 @@
-"""CPU tests for consistency-credited counterfactual bilevel invariants."""
+"""CPU tests for V8.6 part-anchored counterfactual bilevel invariants."""
 
 import unittest
 
@@ -115,6 +115,9 @@ class BilevelSemanticControllerTest(unittest.TestCase):
                 "mask": torch.ones_like(classification_losses),
                 "classification_losses": classification_losses,
                 "consistency_losses": consistency_losses,
+                "species_anchor_losses": (
+                    pooled - 0.75 * targets[:, 0]
+                ).square().mean(dim=-1),
             }
 
         meta_loss, stats, aux = controller.meta_objective(
@@ -203,6 +206,111 @@ class BilevelSemanticControllerTest(unittest.TestCase):
             parameter.grad is not None
             for parameter in controller.adapter.parameters()
         ))
+
+    def test_residual_route_preserves_part_anchor(self):
+        route = torch.tensor([[0.95, 0.04, 0.01]])
+        competitive_part, competitive_relation = (
+            self.controller._real_alignment_route_weights(
+                route, "competitive"
+            )
+        )
+        residual_part, residual_relation = (
+            self.controller._real_alignment_route_weights(route, "residual")
+        )
+        self.assertTrue(torch.allclose(
+            competitive_part, torch.tensor([0.04])
+        ))
+        self.assertTrue(torch.allclose(
+            competitive_relation, torch.tensor([0.01])
+        ))
+        self.assertTrue(torch.allclose(
+            residual_part, torch.tensor([0.05])
+        ))
+        self.assertTrue(torch.allclose(
+            residual_relation, torch.tensor([0.01])
+        ))
+
+    def test_residual_unroll_uses_incremental_relation_and_species_guard(self):
+        controller = BilevelSemanticController(
+            dim=self.dim,
+            text_dim=24,
+            num_parts=self.parts,
+            semantic_rank=8,
+            adapter_rank=8,
+            policy_hidden_dim=16,
+            reference_mix=0.5,
+            relation_hvp_samples=1,
+            routing_scope="counterfactual",
+        )
+        support = self._state_for(controller, 31, compute_hvp=False)
+        query = self._state_for(controller, 32, compute_hvp=False)
+        branch_calls = []
+        branch_classification = (
+            (1.0, 1.0, 1.0),
+            (0.8, 0.8, 0.8),
+            (0.9, 0.6, 0.6),
+        )
+        branch_anchor = (0.0, 0.001, 0.02)
+
+        def outer_task_fn(state, params, reference):
+            branch_idx = len(branch_calls)
+            branch_calls.append(branch_idx)
+            classification = reference.new_tensor(
+                branch_classification[branch_idx]
+            ).view(1, 3).expand(self.batch, -1)
+            return {
+                "losses": classification,
+                "mask": torch.ones_like(classification),
+                "classification_losses": classification,
+                "consistency_losses": torch.zeros_like(classification),
+                "species_anchor_losses": reference.new_full(
+                    (self.batch,), branch_anchor[branch_idx]
+                ),
+            }
+
+        _, stats, aux = controller.meta_objective(
+            support,
+            query,
+            inner_lr=0.1,
+            scope="counterfactual",
+            outer_task_fn=outer_task_fn,
+            task_weight=1.0,
+            semantic_weight=0.1,
+            kl_weight=0.0,
+            router_kl_weight=0.0,
+            router_advantage_scale=1.0,
+            normalize_inner_grad=True,
+            safe_improvement_margin=0.0,
+            normalize_router_regret=True,
+            router_regret_floor=1.0e-4,
+            safe_route_budget=0.05,
+            consistency_credit_weight=0.25,
+            counterfactual_compose="residual",
+            relation_residual_inner_scale=0.5,
+            species_no_regret_margin=0.01,
+            species_anchor_kl_margin=0.01,
+            safe_gate=True,
+            return_aux=True,
+        )
+        self.assertEqual(branch_calls, [0, 1, 2])
+        self.assertEqual(stats["counterfactual_residual_mode"].item(), 1.0)
+        self.assertAlmostEqual(
+            stats["meta_part_inner_step_norm"].item(), 0.1, places=5
+        )
+        self.assertAlmostEqual(
+            stats["meta_relation_inner_step_norm"].item(), 0.05, places=5
+        )
+        self.assertEqual(
+            stats["meta_species_no_regret_accept_rate"].item(), 0.0
+        )
+        self.assertFalse(aux["species_no_regret_guard"].any().item())
+        self.assertFalse(aux["branch_eligibility"][:, :, 1].any().item())
+        self.assertGreater(
+            stats[
+                "meta_family_relation_incremental_classification_improvement"
+            ].item(),
+            0.0,
+        )
 
     def test_counterfactual_safe_gate_validates_shape(self):
         controller = BilevelSemanticController(
