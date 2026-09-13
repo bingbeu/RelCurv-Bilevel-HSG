@@ -20,6 +20,29 @@ import torch.nn.functional as F
 import time
 from collections import Counter
 
+from engine_vit_hier_eval_image import air_trees, birds_trees
+
+
+_AIR_TREE = frozenset(tuple(path) for path in air_trees)
+_BIRD_TREE = frozenset(tuple(path) for path in birds_trees)
+
+
+def _consistent_path_count(fine_pred, family_pred, order_pred, dataset):
+    """Count taxonomy-valid predicted paths in the official tree ordering."""
+    if 'AIR' in dataset:
+        paths = zip(fine_pred, family_pred, order_pred)
+        tree = _AIR_TREE
+    elif 'BIRD' in dataset:
+        # The published CUB tree stores Species/Order/Family.
+        paths = zip(fine_pred, order_pred, family_pred)
+        tree = _BIRD_TREE
+    else:
+        return None
+    return sum(
+        tuple(int(label) + 1 for label in path) in tree
+        for path in paths
+    )
+
 
 def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -211,7 +234,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                 )
 
             with torch.cuda.amp.autocast(enabled=False):
-                meta_loss, meta_stats = core_model.bilevel.meta_objective(
+                meta_loss, meta_stats, meta_aux = core_model.bilevel.meta_objective(
                     support_meta_state,
                     query_meta_state,
                     inner_lr=args.meta_inner_lr,
@@ -229,6 +252,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                         args.meta_basic_weight,
                     ),
                     router_advantage_scale=args.meta_router_advantage_scale,
+                    normalize_inner_grad=args.meta_inner_grad_normalization,
+                    safe_improvement_margin=args.meta_safe_improvement_margin,
+                    return_aux=True,
                 )
             policy_params = tuple(
                 core_model.bilevel.policy_parameters(args.meta_scope)
@@ -262,6 +288,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     args.meta_fine_weight,
                     args.meta_family_weight,
                     args.meta_basic_weight,
+                ),
+                branch_eligibility=(
+                    None if args.no_meta_safe_gate
+                    else meta_aux.get('branch_eligibility')
                 ),
             )
             meta_stats.update(real_stats)
@@ -315,7 +345,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
    
 
 @torch.no_grad()
-def evaluate(data_loader, model, device, n_classes=3, texts=None):
+def evaluate(
+    data_loader, model, device, n_classes=3, texts=None, dataset='IMNET-F'
+):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -323,6 +355,11 @@ def evaluate(data_loader, model, device, n_classes=3, texts=None):
 
     # switch to evaluation mode
     model.eval()
+
+    fpa_count = 0
+    consistent_count = 0
+    total_count = 0
+    has_consistency_tree = 'AIR' in dataset or 'BIRD' in dataset
 
     for images, target, sub_targets, basic_targets in metric_logger.log_every(data_loader, 10, header):
         images = images.to(device, non_blocking=True)
@@ -350,10 +387,44 @@ def evaluate(data_loader, model, device, n_classes=3, texts=None):
         metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
         metric_logger.meters['sub_acc1'].update(sub_acc1.item(), n=batch_size)
         metric_logger.meters['basic_acc1'].update(basic_acc1.item(), n=batch_size)
+
+        fine_pred = output.argmax(dim=1)
+        family_pred = sub_out.argmax(dim=1)
+        order_pred = basic_out.argmax(dim=1)
+        fpa_count += int((
+            fine_pred.eq(target)
+            & family_pred.eq(sub_targets)
+            & order_pred.eq(basic_targets)
+        ).sum().item())
+        total_count += batch_size
+        if has_consistency_tree:
+            consistent_count += int(_consistent_path_count(
+                fine_pred.detach().cpu().tolist(),
+                family_pred.detach().cpu().tolist(),
+                order_pred.detach().cpu().tolist(),
+                dataset,
+            ))
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
+
+    hierarchy_counts = torch.tensor(
+        [fpa_count, consistent_count, total_count],
+        device=device,
+        dtype=torch.float64,
+    )
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(hierarchy_counts, op=dist.ReduceOp.SUM)
+    global_fpa, global_consistent, global_total = hierarchy_counts.tolist()
+    fpa = 100.0 * global_fpa / max(global_total, 1.0)
+    tice = (
+        100.0 * (global_total - global_consistent) / max(global_total, 1.0)
+        if has_consistency_tree else float('nan')
+    )
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} sub@1 {subtop1.global_avg:.3f}' 
         ' manu@1 {manutop1.global_avg:.3f} sploss {losses.global_avg:.3f} fmloss {fmlosses.global_avg:.3f} basicloss {basiclosses.global_avg:.3f}'
         .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.sploss, fmlosses=metric_logger.subordloss, basiclosses=metric_logger.manuloss,
                 subtop1=metric_logger.sub_acc1, manutop1=metric_logger.basic_acc1))
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    print(f'FPA: {fpa:.3f}% | TICE: {tice:.3f}%')
+    stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats.update({'fpa': fpa, 'tice': tice})
+    return stats

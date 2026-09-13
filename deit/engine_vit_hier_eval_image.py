@@ -114,7 +114,9 @@ def evaluate_detail(data_loader, model, device, filename, n_classes=3, dataset='
         .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.sploss, subordlosses=metric_logger.subordloss, basiclosses=metric_logger.basicloss,
                 subtop1=metric_logger.sub_acc1, basictop1=metric_logger.basic_acc1))
     
-    print(f"FPA: {(fpa_cnt / total_cnt) * 100:.3f}% | TICE: {((total_cnt - tice_cnt) / total_cnt) * 100:.3f}% ")
+    fpa = (fpa_cnt / total_cnt) * 100
+    tice = ((total_cnt - tice_cnt) / total_cnt) * 100
+    print(f"FPA: {fpa:.3f}% | TICE: {tice:.3f}% ")
 
     with open(filename, 'w', newline='') as csvfile:
         csvwriter = csv.writer(csvfile, delimiter=',')
@@ -122,7 +124,9 @@ def evaluate_detail(data_loader, model, device, filename, n_classes=3, dataset='
         csvwriter.writerows(str(tice_cnt))
     
         
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats.update({'fpa': fpa, 'tice': tice})
+    return stats
 
 air_trees = [
 [1, 1, 1],

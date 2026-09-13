@@ -1,4 +1,4 @@
-"""CPU tests for V7 adaptive-granularity bilevel invariants."""
+"""CPU tests for safe all-level counterfactual bilevel invariants."""
 
 import unittest
 
@@ -105,7 +105,7 @@ class BilevelSemanticControllerTest(unittest.TestCase):
             )
             return losses, torch.ones_like(losses)
 
-        meta_loss, stats = controller.meta_objective(
+        meta_loss, stats, aux = controller.meta_objective(
             support,
             query,
             inner_lr=0.1,
@@ -116,6 +116,9 @@ class BilevelSemanticControllerTest(unittest.TestCase):
             kl_weight=0.0,
             router_kl_weight=0.0,
             router_advantage_scale=10.0,
+            normalize_inner_grad=True,
+            safe_improvement_margin=1.0e-5,
+            return_aux=True,
         )
         router_params = tuple(controller.router.parameters())
         router_grads = torch.autograd.grad(
@@ -132,12 +135,29 @@ class BilevelSemanticControllerTest(unittest.TestCase):
             self.assertIn(f"meta_{task_name}_relation_improvement", stats)
         self.assertIn("meta_part_task_improvement", stats)
         self.assertIn("meta_relation_task_improvement", stats)
+        self.assertAlmostEqual(
+            stats["meta_part_inner_step_norm"].item(), 0.1, places=5
+        )
+        self.assertAlmostEqual(
+            stats["meta_relation_inner_step_norm"].item(), 0.1, places=5
+        )
+        self.assertEqual(
+            tuple(aux["branch_eligibility"].shape), (self.batch, 3, 2)
+        )
+        self.assertEqual(aux["branch_eligibility"].dtype, torch.bool)
 
         for parameter in controller.parameters():
             parameter.grad = None
-        real_loss, _ = controller.real_weighted_alignment(
-            support, scope="counterfactual"
+        real_loss, safe_stats = controller.real_weighted_alignment(
+            support,
+            scope="counterfactual",
+            branch_eligibility=torch.zeros(
+                self.batch, 3, 2, dtype=torch.bool
+            ),
         )
+        self.assertEqual(safe_stats["safe_route_skip"].item(), 1.0)
+        self.assertEqual(safe_stats["safe_route_part"].item(), 0.0)
+        self.assertEqual(safe_stats["safe_route_relation"].item(), 0.0)
         real_loss.backward()
         self.assertFalse(any(
             parameter.grad is not None
@@ -147,6 +167,26 @@ class BilevelSemanticControllerTest(unittest.TestCase):
             parameter.grad is not None
             for parameter in controller.adapter.parameters()
         ))
+
+    def test_counterfactual_safe_gate_validates_shape(self):
+        controller = BilevelSemanticController(
+            dim=self.dim,
+            text_dim=24,
+            num_parts=self.parts,
+            semantic_rank=8,
+            adapter_rank=8,
+            policy_hidden_dim=16,
+            reference_mix=0.5,
+            relation_hvp_samples=1,
+            routing_scope="counterfactual",
+        )
+        state = self._state_for(controller, 24, compute_hvp=False)
+        with self.assertRaisesRegex(ValueError, "eligibility must have shape"):
+            controller.real_weighted_alignment(
+                state,
+                scope="counterfactual",
+                branch_eligibility=torch.ones(self.batch, 2),
+            )
 
     def test_part_meta_gradient_and_direct_gradient_isolation(self):
         support = self._state(1, compute_hvp=False)

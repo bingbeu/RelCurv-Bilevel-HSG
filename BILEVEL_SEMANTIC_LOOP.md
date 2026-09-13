@@ -1,16 +1,16 @@
-# All-Level Counterfactual Task-Feedback Bilevel Optimization (V8)
+# Safe All-Level Counterfactual Task-Feedback Bilevel Optimization (V8.1)
 
 Let `theta` denote the backbone and classifier, `psi` the shared semantic
 adapter, and `phi` the token policies plus granularity router.
 
 For a support view, local and relation policies produce `p_part` and `p_rel`.
-V8 does not mix their losses before the virtual update.  It constructs three
+V8.1 does not mix their losses before the virtual update. It constructs three
 counterfactual adapter states:
 
 ```text
 psi_skip = psi
-psi_part = psi - inner_lr * grad_psi L_part
-psi_rel  = psi - inner_lr * grad_psi L_relation
+psi_part = psi - inner_lr * normalize(grad_psi L_part)
+psi_rel  = psi - inner_lr * normalize(grad_psi L_relation)
 ```
 
 Each state is evaluated on the paired query view for Species, Family and Order:
@@ -47,6 +47,27 @@ item weights nor learned route weights multiply the raw query loss. Thus the
 policy is rewarded for selecting an update that improves post-update query
 performance, not for selecting items with an already small error.  The mask
 `M` follows the official free-grained label protocol.
+
+## Safe real update
+
+For each example, hierarchy level and non-skip branch, V8.1 computes the stopped
+relative query improvement
+
+```text
+A[t,b] = (J[t,skip] - J[t,b]) / max(abs(J[t,skip]), 1e-3)
+```
+
+Only branches with `A[t,b] > --meta-safe-improvement-margin` may contribute to
+the real adapter loss. Probability assigned to a rejected branch is transferred
+to `skip`; it is not renormalized onto another semantic branch. The eligibility
+mask is detached, while the router and item policies are still optimized by the
+differentiable counterfactual outer objective. `--no-meta-safe-gate` is the
+required unsafe ablation.
+
+Part and Relation raw gradients are normalized separately over the complete
+shared-adapter parameter vector. Consequently, `--meta-inner-lr` is the L2 norm
+of each virtual step. `--no-meta-inner-grad-normalization` restores the V8 raw
+gradient update for ablation.
 
 ## FPA and TICE surrogates
 
@@ -92,10 +113,12 @@ is computed in FP32 and stopped before entering the policy.
 2. Part-only V7 (`--meta-scope part`).
 3. Fixed hybrid (`--meta-scope hybrid`).
 4. V7 pre-mixed routing (`--meta-scope adaptive`).
-5. V8 all-level counterfactual routing (`--meta-scope counterfactual`).
-6. V8 without the consistency surrogate (`--meta-consistency-weight 0`).
-7. V8 without relation HVP (`--no-relation-hvp`).
+5. V8.1 safe all-level counterfactual routing (`--meta-scope counterfactual`).
+6. V8.1 without the consistency surrogate (`--meta-consistency-weight 0`).
+7. V8.1 without relation HVP (`--no-relation-hvp`).
 8. Uniform item policies (`--meta-reference-mix 0`).
 9. Task-free outer objective (`--meta-task-weight 0`) as a diagnostic only.
+10. Raw virtual gradients (`--no-meta-inner-grad-normalization`).
+11. Unsafe real update (`--no-meta-safe-gate`).
 
 Use identical initialization, schedules and paired seeds for every comparison.

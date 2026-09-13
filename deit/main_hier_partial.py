@@ -191,6 +191,12 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     
     parser.add_argument('--filename', default='reverse_best.csv', type=str)
+    parser.add_argument(
+        '--checkpoint-metric', default='auto',
+        choices=['auto', 'acc1', 'fpa'],
+        help=('best-checkpoint metric; auto uses FPA for counterfactual routing '
+              'and Species Acc@1 for legacy methods'),
+    )
     parser.add_argument('--random_seed', default=1, type=int)
     parser.add_argument('--sim_loss_weight', default=1.0, type=float)
     parser.add_argument('--family_sem_weight', default=0.5, type=float)
@@ -221,6 +227,14 @@ def get_args_parser():
     parser.add_argument('--meta-reference-mix', default=0.5, type=float,
                         help='rho in p=(1-rho)q+rho*softmax(logits/tau)')
     parser.add_argument('--meta-inner-lr', default=0.1, type=float)
+    parser.add_argument(
+        '--no-meta-inner-grad-normalization',
+        action='store_false',
+        dest='meta_inner_grad_normalization',
+        help=('use the raw counterfactual inner gradient; by default each '
+              'Part/Relation virtual step has L2 norm meta-inner-lr'),
+    )
+    parser.set_defaults(meta_inner_grad_normalization=True)
     parser.add_argument('--meta-lr', default=1e-4, type=float)
     parser.add_argument('--meta-weight-decay', default=1e-4, type=float)
     parser.add_argument('--meta-real-weight', default=0.1, type=float)
@@ -241,6 +255,15 @@ def get_args_parser():
     parser.add_argument('--meta-router-advantage-scale', default=100.0, type=float,
                         help=('scale normalized post-update branch regret in the '
                               'counterfactual outer objective'))
+    parser.add_argument(
+        '--meta-safe-improvement-margin', default=1e-5, type=float,
+        help=('minimum relative query-task gain required before a '
+              'counterfactual Part/Relation branch may update the real model'),
+    )
+    parser.add_argument(
+        '--no-meta-safe-gate', action='store_true',
+        help='ablate positive-gain gating of the real counterfactual update',
+    )
     parser.add_argument('--meta-consistency-weight', default=0.1, type=float,
                         help=('Jensen-Shannon hierarchy consistency weight used '
                               'by the counterfactual query evaluator'))
@@ -552,6 +575,14 @@ def main(args):
     )
 
     output_dir = Path(args.output_dir)
+    checkpoint_metric = args.checkpoint_metric
+    if checkpoint_metric == 'auto':
+        checkpoint_metric = (
+            'fpa' if args.meta_scope == 'counterfactual' else 'acc1'
+        )
+    max_accuracy = 0.0
+    best_checkpoint_score = float('-inf')
+    best_checkpoint_tice = float('inf')
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -559,6 +590,14 @@ def main(args):
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'])
+        max_accuracy = float(checkpoint.get('accuracy', 0.0))
+        if checkpoint.get('checkpoint_metric') == checkpoint_metric:
+            best_checkpoint_score = float(
+                checkpoint.get('best_checkpoint_score', best_checkpoint_score)
+            )
+            best_checkpoint_tice = float(
+                checkpoint.get('best_checkpoint_tice', best_checkpoint_tice)
+            )
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -575,9 +614,11 @@ def main(args):
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
 
-    print(f"Start training for {args.epochs} epochs")
+    print(
+        f"Start training for {args.epochs} epochs "
+        f"(best checkpoint metric: {checkpoint_metric})"
+    )
     start_time = time.time()
-    max_accuracy = 0.0
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
@@ -592,29 +633,26 @@ def main(args):
         )
 
         lr_scheduler.step(epoch)
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'accuracy': max_accuracy,
-                    'model_ema': get_state_dict(model_ema),
-                    'scaler': loss_scaler.state_dict(),
-                    'meta_optimizer': (
-                        meta_optimizer.state_dict() if meta_optimizer is not None else None
-                    ),
-                    'args': args,
-                }, checkpoint_path)
-             
-
-        test_stats = evaluate(data_loader_val, model, device, len(args.nb_classes), args.texts)
+        test_stats = evaluate(
+            data_loader_val, model, device, len(args.nb_classes),
+            args.texts, dataset=args.data_set,
+        )
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        
-        if max_accuracy < test_stats["acc1"]:
-            max_accuracy = test_stats["acc1"]
+
+        max_accuracy = max(max_accuracy, test_stats['acc1'])
+        checkpoint_score = float(test_stats[checkpoint_metric])
+        checkpoint_tice = float(test_stats.get('tice', float('inf')))
+        checkpoint_is_better = checkpoint_score > best_checkpoint_score
+        if (
+            checkpoint_metric == 'fpa'
+            and checkpoint_score == best_checkpoint_score
+            and checkpoint_tice < best_checkpoint_tice
+        ):
+            checkpoint_is_better = True
+
+        if checkpoint_is_better:
+            best_checkpoint_score = checkpoint_score
+            best_checkpoint_tice = checkpoint_tice
             if args.output_dir:
                 checkpoint_paths = [output_dir / 'best_checkpoint.pth']
                 for checkpoint_path in checkpoint_paths:
@@ -624,6 +662,11 @@ def main(args):
                         'lr_scheduler': lr_scheduler.state_dict(),
                         'epoch': epoch,
                         'accuracy': max_accuracy,
+                        'checkpoint_metric': checkpoint_metric,
+                        'best_checkpoint_score': best_checkpoint_score,
+                        'best_checkpoint_tice': best_checkpoint_tice,
+                        'fpa': test_stats['fpa'],
+                        'tice': test_stats['tice'],
                         'model_ema': get_state_dict(model_ema),
                         'scaler': loss_scaler.state_dict(),
                         'meta_optimizer': (
@@ -631,8 +674,36 @@ def main(args):
                         ),
                         'args': args,
                     }, checkpoint_path)
+
+        # Save the latest state after evaluation so resume metadata includes
+        # the checkpoint decision made for this same epoch.
+        if args.output_dir:
+            checkpoint_paths = [output_dir / 'checkpoint.pth']
+            for checkpoint_path in checkpoint_paths:
+                utils.save_on_master({
+                    'model': model_without_ddp.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
+                    'epoch': epoch,
+                    'accuracy': max_accuracy,
+                    'checkpoint_metric': checkpoint_metric,
+                    'best_checkpoint_score': best_checkpoint_score,
+                    'best_checkpoint_tice': best_checkpoint_tice,
+                    'fpa': test_stats['fpa'],
+                    'tice': test_stats['tice'],
+                    'model_ema': get_state_dict(model_ema),
+                    'scaler': loss_scaler.state_dict(),
+                    'meta_optimizer': (
+                        meta_optimizer.state_dict()
+                        if meta_optimizer is not None else None
+                    ),
+                    'args': args,
+                }, checkpoint_path)
             
-        print(f'Max accuracy: {max_accuracy:.2f}%')
+        print(
+            f'Max accuracy: {max_accuracy:.2f}% | '
+            f'Best {checkpoint_metric}: {best_checkpoint_score:.3f}%'
+        )
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
