@@ -1,4 +1,4 @@
-name: Confidence-budgeted counterfactual bilevel V8.4 tensor tests
+name: Consistency-credited counterfactual bilevel V8.5 tensor tests
 
 on:
   push:
@@ -9,6 +9,7 @@ on:
       - "codex/calibrated-counterfactual-v8-2"
       - "codex/two-stage-safe-router-v8-3"
       - "codex/confidence-budget-router-v8-4"
+      - "codex/consistency-credit-router-v8-5"
   pull_request:
 
 jobs:
@@ -25,3 +26,4 @@ jobs:
         run: python -m compileall -q deit
       - name: Test bilevel invariants
         run: PYTHONPATH=deit python -m unittest -v deit/test_semantic_bilevel.py
+
