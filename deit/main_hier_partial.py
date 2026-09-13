@@ -274,19 +274,21 @@ def get_args_parser():
     )
     parser.add_argument(
         '--meta-safe-route-budget', default=0.05, type=float,
-        help=('maximum non-Skip probability assigned by the two-stage '
-              'counterfactual route; must be between zero and one'),
+        help=('fixed non-Skip probability assigned whenever at least one '
+              'counterfactual branch is safe; must be between zero and one'),
     )
     parser.add_argument(
         '--meta-safe-confidence-scale', default=1.0, type=float,
-        help=('calibrated positive gain that receives the complete non-Skip '
-              'budget; weaker gains receive a proportional budget'),
+        help=('calibrated positive gain at which confidence reweighting of '
+              'Part/Relation allocation saturates'),
     )
     parser.add_argument(
+        '--no-meta-safe-confidence-routing',
         '--no-meta-safe-confidence-budget',
         action='store_false',
         dest='meta_safe_confidence_budget',
-        help='restore the fixed-budget V8.3 safe route',
+        help=('disable confidence reweighting of the conditional '
+              'Part/Relation route; the legacy V8.4 option name is retained'),
     )
     parser.set_defaults(meta_safe_confidence_budget=True)
     parser.add_argument(
@@ -296,6 +298,11 @@ def get_args_parser():
     parser.add_argument('--meta-consistency-weight', default=0.1, type=float,
                         help=('Jensen-Shannon hierarchy consistency weight used '
                               'by the counterfactual query evaluator'))
+    parser.add_argument(
+        '--meta-consistency-credit-weight', default=0.25, type=float,
+        help=('weight of independently RMS-calibrated hierarchy-consistency '
+              'regret in the Part/Relation router objective'),
+    )
     parser.add_argument('--meta-fine-weight', default=1.0, type=float)
     parser.add_argument('--meta-family-weight', default=0.5, type=float)
     parser.add_argument('--meta-basic-weight', default=0.5, type=float)
