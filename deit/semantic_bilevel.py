@@ -12,9 +12,10 @@ Only the post-update outer objective updates ``phi``.
 V8 adds a branch-counterfactual, all-level route.  Skip, part and relation
 updates are unrolled independently and evaluated on Species, Family and Order
 losses.  V8.2 calibrates branch regret inside every example and hierarchy
-level. V8.3 separates safety from semantic selection. V8.4 additionally makes
-the bounded real-update budget proportional to stopped calibrated gain, so a
-barely positive branch cannot receive the same update as a reliable one.
+level. V8.3 separates safety from semantic selection. V8.4 scales the complete
+budget by confidence. V8.5 restores a fixed safe budget, uses confidence only
+for conditional Part/Relation allocation, and credits independently calibrated
+taxonomy-consistency gains in every hierarchy-level route.
 """
 
 import math
@@ -771,11 +772,11 @@ class BilevelSemanticController(nn.Module):
         ``learned_route`` keeps the legacy Skip/Part/Relation shape, but its
         Skip logit is intentionally removed by conditioning on the two
         semantic branches.  Eligibility is stopped counterfactual evidence.
-        V8.4 scales ``non_skip_budget`` continuously by the strongest stopped,
-        calibrated positive gain. Marginal improvements therefore receive a
-        small real update, while confidence at or above ``confidence_scale``
-        receives the complete budget. Without confidence evidence this helper
-        retains the V8.3 fixed-budget behavior for unsafe ablations.
+        V8.5 keeps the safe non-Skip budget fixed whenever at least one branch
+        has positive stopped evidence.  Confidence only reweights the learned
+        conditional Part-versus-Relation allocation.  This preserves the
+        bounded V8.3 update strength while allowing stronger counterfactual
+        evidence to choose which semantic update receives that budget.
         """
         if learned_route.size(-1) != 3:
             raise ValueError("two-stage route requires Skip/Part/Relation logits")
@@ -803,9 +804,7 @@ class BilevelSemanticController(nn.Module):
             )
 
         if branch_confidence is None:
-            confidence_fraction = torch.ones_like(
-                conditional_route[..., :1]
-            )
+            confidence_weight = torch.ones_like(conditional_route)
         else:
             if tuple(branch_confidence.shape) != tuple(conditional_route.shape):
                 raise ValueError(
@@ -817,21 +816,17 @@ class BilevelSemanticController(nn.Module):
                 device=conditional_route.device,
                 dtype=conditional_route.dtype,
             ).clamp_min(0.0)
-            strongest_confidence = (confidence * eligible).max(
-                dim=-1, keepdim=True
-            ).values
-            confidence_fraction = (
-                strongest_confidence / float(confidence_scale)
-            ).clamp(min=0.0, max=1.0)
+            confidence_weight = (
+                confidence / float(confidence_scale)
+            ).clamp(min=1.0e-8, max=1.0)
 
-        eligible_route = conditional_route * eligible
+        eligible_route = conditional_route * eligible * confidence_weight
         eligible_mass = eligible_route.sum(dim=-1, keepdim=True)
         has_eligible = eligible_mass.gt(0.0)
         eligible_route = eligible_route / eligible_mass.clamp_min(1.0e-8)
         semantic_budget = (
             has_eligible.to(conditional_route.dtype)
             * float(non_skip_budget)
-            * confidence_fraction
         )
         safe_non_skip = semantic_budget * eligible_route
         safe_skip = 1.0 - safe_non_skip.sum(dim=-1, keepdim=True)
@@ -847,22 +842,30 @@ class BilevelSemanticController(nn.Module):
     def _task_output(
         value,
         batch_size: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Validate an all-level outer evaluator result.
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        """Validate an all-level outer evaluator and expose route credits.
 
         Counterfactual routing needs unreduced losses so the support/query pair
-        keeps its own route.  The expected format is ``(losses, mask)`` with
-        both tensors shaped ``(B, 3)`` in Species/Family/Order order.
+        keeps its own route.  A rich dictionary may additionally separate
+        supervised classification and hierarchy-consistency losses.  Legacy
+        ``(losses, mask)`` evaluators remain valid and receive zero independent
+        consistency credit.
         """
         if isinstance(value, dict):
             losses = value.get("losses")
             mask = value.get("mask")
+            classification_losses = value.get("classification_losses", losses)
+            consistency_losses = value.get("consistency_losses")
         elif isinstance(value, (tuple, list)) and len(value) == 2:
             losses, mask = value
+            classification_losses = losses
+            consistency_losses = None
         else:
             raise TypeError(
-                "counterfactual outer_task_fn must return (losses, mask) "
-                "with shape (B, 3)"
+                "counterfactual outer_task_fn must return (losses, mask) or "
+                "a component dictionary with shape (B, 3)"
             )
         if not isinstance(losses, torch.Tensor) or not isinstance(mask, torch.Tensor):
             raise TypeError("counterfactual task losses and mask must be tensors")
@@ -873,7 +876,26 @@ class BilevelSemanticController(nn.Module):
             )
         if tuple(mask.shape) != tuple(losses.shape):
             raise ValueError("counterfactual task mask must match task losses")
-        return losses.float(), mask.to(device=losses.device, dtype=losses.dtype)
+        if not isinstance(classification_losses, torch.Tensor):
+            raise TypeError("counterfactual classification losses must be a tensor")
+        if tuple(classification_losses.shape) != tuple(losses.shape):
+            raise ValueError(
+                "counterfactual classification losses must match task losses"
+            )
+        if consistency_losses is None:
+            consistency_losses = torch.zeros_like(losses)
+        if not isinstance(consistency_losses, torch.Tensor):
+            raise TypeError("counterfactual consistency losses must be a tensor")
+        if tuple(consistency_losses.shape) != tuple(losses.shape):
+            raise ValueError(
+                "counterfactual consistency losses must match task losses"
+            )
+        return (
+            losses.float(),
+            mask.to(device=losses.device, dtype=losses.dtype),
+            classification_losses.float(),
+            consistency_losses.float(),
+        )
 
     def _counterfactual_alignment(
         self,
@@ -922,6 +944,7 @@ class BilevelSemanticController(nn.Module):
         safe_route_budget: float,
         safe_confidence_scale: float,
         safe_confidence_budget: bool,
+        consistency_credit_weight: float,
         safe_gate: bool,
     ):
         """Three virtual branches evaluated independently at all three levels."""
@@ -943,6 +966,8 @@ class BilevelSemanticController(nn.Module):
             raise ValueError("safe route budget must be in [0, 1]")
         if safe_confidence_scale <= 0:
             raise ValueError("safe confidence scale must be positive")
+        if consistency_credit_weight < 0:
+            raise ValueError("consistency credit weight must be nonnegative")
 
         level_weights = torch.as_tensor(
             task_level_weights, dtype=torch.float32,
@@ -1049,11 +1074,18 @@ class BilevelSemanticController(nn.Module):
         )
 
         task_branches = []
+        classification_branches = []
+        consistency_branches = []
         align_branches = []
         task_mask = None
         batch_size = support_tokens.size(0)
         for params in branch_params:
-            task_losses, branch_mask = self._task_output(
+            (
+                task_losses,
+                branch_mask,
+                classification_losses,
+                consistency_losses,
+            ) = self._task_output(
                 outer_task_fn(query, params, q_part), batch_size
             )
             if task_mask is None:
@@ -1061,12 +1093,20 @@ class BilevelSemanticController(nn.Module):
             elif not torch.equal(task_mask.bool(), branch_mask.bool()):
                 raise ValueError("all counterfactual branches must use the same task mask")
             task_branches.append(task_losses)
+            classification_branches.append(classification_losses)
+            consistency_branches.append(consistency_losses)
             align_branches.append(self._counterfactual_alignment(
                 query, params, q_part, q_relation, relation_weight
             ))
 
         # (B, task, branch), with branch order skip/part/relation.
         branch_task_loss = torch.stack(task_branches, dim=-1)
+        branch_classification_loss = torch.stack(
+            classification_branches, dim=-1
+        )
+        branch_consistency_loss = torch.stack(
+            consistency_branches, dim=-1
+        )
         branch_align_loss = torch.stack(align_branches, dim=-1)
         weighted_mask = task_mask * level_weights.view(1, 3)
 
@@ -1077,39 +1117,91 @@ class BilevelSemanticController(nn.Module):
             )
             return (level_weights * task_means).sum()
 
-        # Normalized counterfactual regret strengthens only between-branch
-        # evidence.  The skip baseline is common to all routes and contributes
-        # no artificial preference.
-        skip_task = branch_task_loss[:, :, 0].detach()
-        relative_regret = (
-            branch_task_loss - skip_task.unsqueeze(-1)
-        ) / skip_task.abs().unsqueeze(-1).clamp_min(1.0e-3)
-        relative_regret = relative_regret.clamp(min=-10.0, max=10.0)
-        calibrated_regret, regret_rms = self._calibrate_counterfactual_regret(
-            relative_regret,
+        # Classification and hierarchy consistency have very different raw
+        # scales.  Calibrate their branch regrets independently before adding
+        # consistency credit; otherwise CE can hide a relation update that
+        # improves Species/Family/Order agreement.
+        skip_classification = branch_classification_loss[:, :, 0].detach()
+        classification_relative_regret = (
+            branch_classification_loss - skip_classification.unsqueeze(-1)
+        ) / skip_classification.abs().unsqueeze(-1).clamp_min(1.0e-3)
+        classification_relative_regret = classification_relative_regret.clamp(
+            min=-10.0, max=10.0
+        )
+        skip_consistency = branch_consistency_loss[:, :, 0].detach()
+        consistency_relative_regret = (
+            branch_consistency_loss - skip_consistency.unsqueeze(-1)
+        ) / skip_consistency.abs().unsqueeze(-1).clamp_min(1.0e-3)
+        consistency_relative_regret = consistency_relative_regret.clamp(
+            min=-10.0, max=10.0
+        )
+        (
+            calibrated_classification_regret,
+            classification_regret_rms,
+        ) = self._calibrate_counterfactual_regret(
+            classification_relative_regret,
             improvement_margin=safe_improvement_margin,
             scale_floor=router_regret_floor,
             normalize=normalize_router_regret,
         )
+        (
+            calibrated_consistency_regret,
+            consistency_regret_rms,
+        ) = self._calibrate_counterfactual_regret(
+            consistency_relative_regret,
+            improvement_margin=0.0,
+            scale_floor=router_regret_floor,
+            normalize=normalize_router_regret,
+        )
+        calibrated_regret = (
+            calibrated_classification_regret
+            + float(consistency_credit_weight)
+            * calibrated_consistency_regret
+        )
+        relative_regret = (
+            classification_relative_regret
+            + float(consistency_credit_weight) * consistency_relative_regret
+        )
+        regret_rms = torch.sqrt(
+            classification_regret_rms.square()
+            + (
+                float(consistency_credit_weight) * consistency_regret_rms
+            ).square()
+        )
         if normalize_router_regret:
             confidence_regret = calibrated_regret
         else:
-            confidence_regret, _ = self._calibrate_counterfactual_regret(
-                relative_regret,
-                improvement_margin=safe_improvement_margin,
-                scale_floor=router_regret_floor,
-                normalize=True,
+            normalized_classification_regret, _ = (
+                self._calibrate_counterfactual_regret(
+                    classification_relative_regret,
+                    improvement_margin=safe_improvement_margin,
+                    scale_floor=router_regret_floor,
+                    normalize=True,
+                )
+            )
+            normalized_consistency_regret, _ = (
+                self._calibrate_counterfactual_regret(
+                    consistency_relative_regret,
+                    improvement_margin=0.0,
+                    scale_floor=router_regret_floor,
+                    normalize=True,
+                )
+            )
+            confidence_regret = (
+                normalized_classification_regret
+                + float(consistency_credit_weight)
+                * normalized_consistency_regret
             )
         # The stopped gate owns the Skip decision.  The learned router is
         # conditioned on semantic updates and can only choose Part versus
         # Relation.  This prevents expected-regret training from escaping into
         # the global all-Skip solution observed in V8.1/V8.2.
-        relative_gain = -relative_regret.detach()[:, :, 1:]
+        combined_gain = -calibrated_regret.detach()[:, :, 1:]
         branch_confidence = (
             -confidence_regret.detach()[:, :, 1:]
         ).clamp_min(0.0)
         branch_eligibility = (
-            (relative_gain > float(safe_improvement_margin))
+            (combined_gain > 0.0)
             & task_mask.bool().unsqueeze(-1)
         )
         route_eligibility = branch_eligibility if safe_gate else None
@@ -1200,6 +1292,15 @@ class BilevelSemanticController(nn.Module):
             "meta_router_regret_rms": (
                 regret_rms.squeeze(-1) * task_mask
             ).sum().div(task_mask.sum().clamp_min(1.0)).detach(),
+            "meta_router_classification_regret_rms": (
+                classification_regret_rms.squeeze(-1) * task_mask
+            ).sum().div(task_mask.sum().clamp_min(1.0)).detach(),
+            "meta_router_consistency_regret_rms": (
+                consistency_regret_rms.squeeze(-1) * task_mask
+            ).sum().div(task_mask.sum().clamp_min(1.0)).detach(),
+            "meta_router_consistency_credit_weight": calibrated_regret.new_tensor(
+                float(consistency_credit_weight)
+            ).detach(),
             "meta_router_calibrated_abs": (
                 calibrated_regret.detach().abs().mean(dim=-1) * task_mask
             ).sum().div(task_mask.sum().clamp_min(1.0)).detach(),
@@ -1235,6 +1336,24 @@ class BilevelSemanticController(nn.Module):
             skip_value = masked_level_mean(branch_task_loss[:, :, 0], task_idx)
             part_value = masked_level_mean(branch_task_loss[:, :, 1], task_idx)
             relation_value = masked_level_mean(branch_task_loss[:, :, 2], task_idx)
+            skip_classification_value = masked_level_mean(
+                branch_classification_loss[:, :, 0], task_idx
+            )
+            part_classification_value = masked_level_mean(
+                branch_classification_loss[:, :, 1], task_idx
+            )
+            relation_classification_value = masked_level_mean(
+                branch_classification_loss[:, :, 2], task_idx
+            )
+            skip_consistency_value = masked_level_mean(
+                branch_consistency_loss[:, :, 0], task_idx
+            )
+            part_consistency_value = masked_level_mean(
+                branch_consistency_loss[:, :, 1], task_idx
+            )
+            relation_consistency_value = masked_level_mean(
+                branch_consistency_loss[:, :, 2], task_idx
+            )
             stats.update({
                 f"meta_{task_name}_skip_task": skip_value.detach(),
                 f"meta_{task_name}_part_task": part_value.detach(),
@@ -1244,6 +1363,18 @@ class BilevelSemanticController(nn.Module):
                 ).detach(),
                 f"meta_{task_name}_relation_improvement": (
                     skip_value - relation_value
+                ).detach(),
+                f"meta_{task_name}_part_classification_improvement": (
+                    skip_classification_value - part_classification_value
+                ).detach(),
+                f"meta_{task_name}_relation_classification_improvement": (
+                    skip_classification_value - relation_classification_value
+                ).detach(),
+                f"meta_{task_name}_part_consistency_improvement": (
+                    skip_consistency_value - part_consistency_value
+                ).detach(),
+                f"meta_{task_name}_relation_consistency_improvement": (
+                    skip_consistency_value - relation_consistency_value
                 ).detach(),
                 f"safe_{task_name}_part_accept_rate": (
                     branch_eligibility[:, task_idx, 0].float()
@@ -1289,10 +1420,40 @@ class BilevelSemanticController(nn.Module):
                 ).detach()
         part_task = weighted_task_reduce(branch_task_loss[:, :, 1])
         relation_task = weighted_task_reduce(branch_task_loss[:, :, 2])
+        classification_before = weighted_task_reduce(
+            branch_classification_loss[:, :, 0]
+        )
+        part_classification = weighted_task_reduce(
+            branch_classification_loss[:, :, 1]
+        )
+        relation_classification = weighted_task_reduce(
+            branch_classification_loss[:, :, 2]
+        )
+        consistency_before = weighted_task_reduce(
+            branch_consistency_loss[:, :, 0]
+        )
+        part_consistency = weighted_task_reduce(
+            branch_consistency_loss[:, :, 1]
+        )
+        relation_consistency = weighted_task_reduce(
+            branch_consistency_loss[:, :, 2]
+        )
         stats.update({
             "meta_part_task_improvement": (task_before - part_task).detach(),
             "meta_relation_task_improvement": (
                 task_before - relation_task
+            ).detach(),
+            "meta_part_classification_improvement": (
+                classification_before - part_classification
+            ).detach(),
+            "meta_relation_classification_improvement": (
+                classification_before - relation_classification
+            ).detach(),
+            "meta_part_consistency_improvement": (
+                consistency_before - part_consistency
+            ).detach(),
+            "meta_relation_consistency_improvement": (
+                consistency_before - relation_consistency
             ).detach(),
         })
         stats.update(route_stats)
@@ -1321,6 +1482,7 @@ class BilevelSemanticController(nn.Module):
         safe_route_budget: float = 0.05,
         safe_confidence_scale: float = 1.0,
         safe_confidence_budget: bool = True,
+        consistency_credit_weight: float = 0.25,
         safe_gate: bool = True,
         return_aux: bool = False,
     ):
@@ -1352,6 +1514,7 @@ class BilevelSemanticController(nn.Module):
                 safe_route_budget=safe_route_budget,
                 safe_confidence_scale=safe_confidence_scale,
                 safe_confidence_budget=safe_confidence_budget,
+                consistency_credit_weight=consistency_credit_weight,
                 safe_gate=safe_gate,
             )
             return result if return_aux else result[:2]
