@@ -1,8 +1,8 @@
-# Execution-Isolated Bilevel Presets (V8.7.1)
+# Execution-Isolated Bilevel Presets (V8.7.2)
 
 Let `theta` denote the backbone and hierarchy classifiers, `psi` the shared
 semantic adapter, and `phi` the semantic item policies and optional router.
-V8.7.1 exposes two explicit dataset-validated presets. It does not branch on a
+V8.7.2 exposes two explicit dataset-validated presets. It does not branch on a
 dataset name inside the model.
 
 | Preset | Hierarchical solver | Validation metric |
@@ -89,9 +89,11 @@ The real Part route stays at one:
 L_real = mean(stop_gradient(p_part) * L_part)
 ```
 
-V8.7.1 intentionally does not attempt to repair the observed uniform Aircraft
-item policy. The `70.387` FPA / `9.541` TICE path is held fixed as the performance
-anchor; policy-learning changes belong in a later isolated experiment.
+V8.7.2 intentionally does not change the observed uniform Aircraft item
+policy. The existing `70.387` FPA / `9.541` TICE checkpoint remains available,
+but checkpoint provenance shows that it came from a resumed trajectory and
+must not be presented as an uninterrupted strict run. Policy-learning changes
+belong in a later isolated experiment.
 
 ## Strict bilevel invariants
 
@@ -110,10 +112,31 @@ anchor; policy-learning changes belong in a later isolated experiment.
 
 ## Reproducibility contract
 
-Every training row records the preset, resolved scope, composition, solver and
-checkpoint metric. Checkpoints store the complete resolved argument namespace.
-The frozen solver also records `counterfactual_solver_v85_frozen = 1.0` in meta
-statistics.
+Strict runs seed Python, NumPy, Torch CPU, Torch CUDA, and every DataLoader
+worker. They require deterministic PyTorch/cuDNN/cuBLAS execution and disable
+TF32. `PYTHONHASHSEED` and `CUBLAS_WORKSPACE_CONFIG` are set before the Python
+process starts.
 
-Use identical initialization, schedule, data split and paired seeds. The full
-two-GPU training and evaluation commands are in `README.md`.
+Every epoch checkpoint captures Python, NumPy, Torch CPU, and all visible CUDA
+RNG states after evaluation. A strict resume restores those states, the model,
+both optimizers, scaler, EMA, and scheduler. The restored scheduler is not
+advanced before the next epoch. Consequently, stopping after epoch `e` and
+resuming `checkpoint.pth` starts epoch `e+1` from the same stochastic and
+learning-rate state as an uninterrupted run.
+
+`best_checkpoint.pth` is evaluation-only. Training from it is rejected unless
+the user explicitly enables a trajectory-fork ablation. Fresh training also
+refuses an output directory containing `log.txt` or checkpoints, preventing
+multiple runs from being silently combined.
+
+Every training row records the preset, resolved scope, composition, solver,
+checkpoint metric, strict-determinism flag, and whether resume RNG restoration
+succeeded. It also records the process start epoch and resume source so an
+appended continuation cannot masquerade as a single fresh run. Checkpoints
+store the complete resolved argument namespace and a
+`reproducibility_version`. The frozen solver additionally records
+`counterfactual_solver_v85_frozen = 1.0` in meta statistics.
+
+Use identical initialization, schedule, data split, software/hardware stack,
+and paired seeds. The full fresh-training, exact-resume, and evaluation
+commands are in `README.md`.
