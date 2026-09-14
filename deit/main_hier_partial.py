@@ -31,7 +31,12 @@ import models_hier
 import models_v2
 
 import utils
-from method_presets import METHOD_PRESET_CHOICES, apply_method_preset
+from method_presets import (
+    COUNTERFACTUAL_SOLVER_CHOICES,
+    METHOD_PRESET_CHOICES,
+    apply_method_preset,
+    validate_method_configuration,
+)
 
 
 
@@ -201,7 +206,7 @@ def get_args_parser():
     parser.add_argument(
         '--method-preset', default='manual',
         choices=METHOD_PRESET_CHOICES,
-        help=('explicit V8.7 experiment preset; cub-v85 freezes the best CUB '
+        help=('explicit V8.7.1 experiment preset; cub-v85 freezes the CUB '
               'competitive path and air-curvpart-v7 restores the verified '
               'full-strength Aircraft Part path'),
     )
@@ -262,6 +267,13 @@ def get_args_parser():
         help=('competitive reproduces V8.5 skip/part/relation branches; '
               'residual evaluates skip/part/(part+relation) so Relation '
               'cannot replace the Part anchor'),
+    )
+    parser.add_argument(
+        '--counterfactual-solver', default='unified',
+        choices=COUNTERFACTUAL_SOLVER_CHOICES,
+        help=('unified enables the V8.6 residual-capable implementation; '
+              'v85-frozen executes the original V8.5 competitive operation '
+              'order without residual or Species-anchor graph construction'),
     )
     parser.add_argument(
         '--meta-relation-residual-inner-scale', default=0.5, type=float,
@@ -358,6 +370,7 @@ def get_args_parser():
 
 def main(args):
     preset_changes = apply_method_preset(args)
+    validate_method_configuration(args)
     if args.method_preset != 'manual':
         changed_names = ', '.join(sorted(preset_changes)) or 'none'
         print(
@@ -788,6 +801,9 @@ def main(args):
                      'resolved_meta_scope': args.meta_scope,
                      'resolved_counterfactual_compose': (
                          args.counterfactual_compose
+                     ),
+                     'resolved_counterfactual_solver': (
+                         args.counterfactual_solver
                      ),
                      'checkpoint_metric': checkpoint_metric}
         
