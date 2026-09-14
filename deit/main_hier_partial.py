@@ -31,6 +31,7 @@ import models_hier
 import models_v2
 
 import utils
+from method_presets import METHOD_PRESET_CHOICES, apply_method_preset
 
 
 
@@ -197,6 +198,13 @@ def get_args_parser():
         help=('best-checkpoint metric; auto uses FPA for counterfactual routing '
               'and Species Acc@1 for legacy methods'),
     )
+    parser.add_argument(
+        '--method-preset', default='manual',
+        choices=METHOD_PRESET_CHOICES,
+        help=('explicit V8.7 experiment preset; cub-v85 freezes the best CUB '
+              'competitive path and air-curvpart-v7 restores the verified '
+              'full-strength Aircraft Part path'),
+    )
     parser.add_argument('--random_seed', default=1, type=int)
     parser.add_argument('--sim_loss_weight', default=1.0, type=float)
     parser.add_argument('--family_sem_weight', default=0.5, type=float)
@@ -349,6 +357,13 @@ def get_args_parser():
 
 
 def main(args):
+    preset_changes = apply_method_preset(args)
+    if args.method_preset != 'manual':
+        changed_names = ', '.join(sorted(preset_changes)) or 'none'
+        print(
+            f"Applied method preset {args.method_preset!r}; "
+            f"overridden arguments: {changed_names}"
+        )
     print(args)
     if args.distributed:
         utils.init_distributed_mode(args)
@@ -768,7 +783,13 @@ def main(args):
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
                      'epoch': epoch,
-                     'n_parameters': n_parameters}
+                     'n_parameters': n_parameters,
+                     'method_preset': args.method_preset,
+                     'resolved_meta_scope': args.meta_scope,
+                     'resolved_counterfactual_compose': (
+                         args.counterfactual_compose
+                     ),
+                     'checkpoint_metric': checkpoint_metric}
         
         
         
