@@ -1,9 +1,11 @@
-"""CPU tests for V8.6 part-anchored counterfactual bilevel invariants."""
+"""CPU tests for V8.7 preset and counterfactual bilevel invariants."""
 
+from argparse import Namespace
 import unittest
 
 import torch
 
+from method_presets import apply_method_preset, preset_values
 from semantic_bilevel import BilevelSemanticController
 
 
@@ -23,6 +25,54 @@ class BilevelSemanticControllerTest(unittest.TestCase):
             reference_mix=0.5,
             relation_hvp_samples=1,
         )
+
+    def test_v87_presets_are_explicit_and_dataset_checked(self):
+        manual = Namespace(
+            method_preset="manual",
+            data_set="AIR-HIER",
+            meta_scope="adaptive",
+        )
+        self.assertEqual(apply_method_preset(manual), {})
+        self.assertEqual(manual.meta_scope, "adaptive")
+
+        cub = Namespace(
+            method_preset="cub-v85",
+            data_set="BIRD-HIER",
+            enable_bilevel=False,
+            meta_scope="adaptive",
+            counterfactual_compose="residual",
+            checkpoint_metric="auto",
+        )
+        cub_changes = apply_method_preset(cub)
+        self.assertTrue(cub.enable_bilevel)
+        self.assertEqual(cub.meta_scope, "counterfactual")
+        self.assertEqual(cub.counterfactual_compose, "competitive")
+        self.assertEqual(cub.checkpoint_metric, "fpa")
+        self.assertTrue(cub.meta_inner_grad_normalization)
+        self.assertAlmostEqual(cub.meta_safe_route_budget, 0.05)
+        self.assertIn("counterfactual_compose", cub_changes)
+
+        air = Namespace(
+            method_preset="air-curvpart-v7",
+            data_set="AIR-HIER",
+            enable_bilevel=False,
+            meta_scope="counterfactual",
+            checkpoint_metric="fpa",
+        )
+        apply_method_preset(air)
+        self.assertTrue(air.enable_bilevel)
+        self.assertEqual(air.meta_scope, "part")
+        self.assertEqual(air.checkpoint_metric, "acc1")
+        self.assertFalse(air.meta_inner_grad_normalization)
+        self.assertAlmostEqual(air.meta_real_weight, 0.1)
+        self.assertEqual(preset_values("air-curvpart-v7")["meta_scope"], "part")
+
+        wrong_dataset = Namespace(
+            method_preset="cub-v85",
+            data_set="AIR-HIER",
+        )
+        with self.assertRaisesRegex(ValueError, "requires --data-set BIRD-HIER"):
+            apply_method_preset(wrong_dataset)
 
     def _state(self, seed, compute_hvp=True):
         return self._state_for(self.controller, seed, compute_hvp=compute_hvp)
@@ -456,9 +506,11 @@ class BilevelSemanticControllerTest(unittest.TestCase):
 
         for param in self.controller.parameters():
             param.grad = None
-        real_loss, _ = self.controller.real_weighted_alignment(
+        real_loss, real_stats = self.controller.real_weighted_alignment(
             support, scope="part"
         )
+        self.assertEqual(real_stats["meta_real_part_weight"].item(), 1.0)
+        self.assertEqual(real_stats["meta_real_relation_weight"].item(), 0.0)
         real_loss.backward()
         self.assertFalse(any(param.grad is not None for param in policy_params))
         self.assertTrue(any(p.grad is not None for p in self.controller.adapter.parameters()))
