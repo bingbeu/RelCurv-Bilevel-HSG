@@ -1,23 +1,51 @@
-# Explicit Dataset-Validated Bilevel Presets (V8.7)
+# Execution-Isolated Bilevel Presets (V8.7.1)
 
 Let `theta` denote the backbone and hierarchy classifiers, `psi` the shared
-semantic adapter, and `phi` the item policy (plus the granularity router when
-that router is enabled). V8.7 does not introduce a hidden dataset condition in
-the model. It exposes two named command-line presets whose compatibility with
-the requested dataset is validated before the model and optimizers are built.
+semantic adapter, and `phi` the semantic item policies and optional router.
+V8.7.1 exposes two explicit dataset-validated presets. It does not branch on a
+dataset name inside the model.
 
-| Preset | Dataset | Solver | Validation metric |
-|---|---|---|---|
-| `cub-v85` | `BIRD-HIER` | V8.5 competitive Skip/Part/Relation | FPA |
-| `air-curvpart-v7` | `AIR-HIER` | CurvPart V7 Part-only feedback | Species Acc@1 |
+| Preset | Hierarchical solver | Validation metric |
+|---|---|---|
+| `cub-v85` | frozen V8.5 Skip/Part/Relation competitive solver | FPA |
+| `air-curvpart-v7` | unchanged full-strength Part task-feedback path | Species Acc@1 |
 
-Both solvers optimize the complete Species/Family/Order hierarchy. “Part-only”
-describes the semantic update type; it does not mean fine-level-only learning.
+Both paths use Species, Family and Order feedback. Part-only therefore means
+the semantic update granularity, not a restriction to fine labels.
 
-## CUB: V8.5 competitive counterfactual solver
+## Why execution isolation is necessary
 
-The CUB preset constructs three virtual adapters independently from the same
-base adapter:
+V8.5 and V8.7 CUB runs were identical through epoch 4, then diverged exactly
+when bilevel optimization began at epoch 5. V8.6 had preserved the competitive
+equations but reordered Part-gradient and Relation construction operations and
+added a Species-anchor graph. Mathematically equivalent execution was not a
+reproducible freeze of the original optimizer trajectory.
+
+The `v85-frozen` solver therefore contains independent copies of the original
+V8.5 methods:
+
+- `_task_output_v85`;
+- `_counterfactual_meta_objective_v85`;
+- `real_weighted_alignment_v85`.
+
+Their method bodies match the V8.5 source apart from method names. They retain
+the original order: construct Part and Relation evidence, compute both policies,
+then compute the two independent virtual gradients. No residual intermediate or
+Species-anchor graph is constructed on this path.
+
+`--counterfactual-solver v85-frozen` is valid only with:
+
+```text
+meta_scope = counterfactual
+counterfactual_compose = competitive
+```
+
+Invalid combinations fail before model construction. The V8.6 residual solver
+remains available through `--counterfactual-solver unified`.
+
+## Frozen CUB V8.5 solver
+
+The support view constructs independent virtual adapters from the same base:
 
 ```text
 psi_skip = psi
@@ -25,8 +53,7 @@ psi_part = psi - eta * normalize(grad_psi L_part)
 psi_rel  = psi - eta * normalize(grad_psi L_relation)
 ```
 
-Every branch is evaluated on a stopped paired query view at Species, Family and
-Order:
+Each branch is evaluated on the paired query view at every hierarchy level:
 
 ```text
 J_cls[t,b]  = supervised_classification_t(query; psi_b)
@@ -34,27 +61,21 @@ J_cons[t,b] = taxonomy_consistency_t(query; psi_b)
 J[t,b]      = J_cls[t,b] + consistency_weight * J_cons[t,b]
 ```
 
-Classification and taxonomy-consistency regrets are calibrated independently
-within each example and hierarchy level. Positive-gain gating supplies a fixed
-5% non-Skip budget; confidence only allocates that budget between eligible Part
-and Relation branches. The real semantic update uses detached route and item
-weights, while the outer loss alone updates `phi`.
+Classification and consistency regrets are calibrated independently per
+example and level. Positive-gain gating owns Skip. Whenever a semantic branch
+is eligible, a fixed 5% budget is allocated between Part and Relation by the
+conditional router. Learned route and policy weights are detached in the real
+model loss.
 
-This is the exact competitive V8.5 path retained because it produced the best
-observed CUB result. V8.6 residual composition remains available only in
-`--method-preset manual` ablations.
+## Frozen Aircraft V8.7 path
 
-## Aircraft: CurvPart V7 Part-only solver
-
-The Aircraft preset constructs no Relation encoder, Relation policy, or
-granularity router. Its one-step virtual adapter uses the raw Part gradient,
-matching CurvPart-HSG V7:
+Aircraft constructs no Relation modules and uses the raw Part inner gradient:
 
 ```text
 psi_part = psi - eta * grad_psi L_part
 ```
 
-The paired query objective is still hierarchical:
+The query task remains hierarchical:
 
 ```text
 J_part = 1.0 * J_species
@@ -62,50 +83,37 @@ J_part = 1.0 * J_species
        + 0.5 * J_order
 ```
 
-The Part policy receives task feedback only through `J_part(psi_part)`. For the
-real model update, Part alignment is full strength rather than constrained by a
-1--5% counterfactual routing budget:
+The real Part route stays at one:
 
 ```text
 L_real = mean(stop_gradient(p_part) * L_part)
 ```
 
-The top-level multiplier remains `--meta-real-weight 0.1`, as in the verified
-V7 configuration. Best checkpoints are selected by Species Acc@1, matching the
-historical Aircraft protocol.
+V8.7.1 intentionally does not attempt to repair the observed uniform Aircraft
+item policy. The `70.387` FPA / `9.541` TICE path is held fixed as the performance
+anchor; policy-learning changes belong in a later isolated experiment.
 
-## Bilevel separation invariants
+## Strict bilevel invariants
 
 - `phi` is excluded from the main optimizer.
 - Policy inputs, query backbone features, and query semantic targets are
   stopped.
-- Real-loss policy and routing weights are detached.
-- Only the post-update outer objective updates `phi`.
-- Virtual inner gradients retain `create_graph=True` so task feedback can pass
-  through the one-step adapter update.
-- Free-grained Species and Family label masks follow the official protocol.
-- Taxonomy consistency uses predictions and the public hierarchy, not hidden
-  labels.
-- Relation descriptors are training-time evidence and are never concatenated
-  into the inference classifier.
-- This is a differentiable one-step truncated bilevel method, not an exact
-  solution of an inner argmin.
+- Only post-update query objectives update `phi`.
+- Virtual inner gradients retain `create_graph=True`.
+- Real-loss policy, route, confidence and eligibility weights are detached.
+- The official free-grained Species/Family masks are preserved.
+- Consistency uses predictions and the public taxonomy, not hidden labels.
+- Relation evidence is training-only and is never concatenated into the
+  inference classifier.
+- The method is a differentiable one-step truncated bilevel solver, not an
+  exact inner argmin.
 
-## Reproducibility and comparison
+## Reproducibility contract
 
-The preset name, resolved scope, resolved composition, and checkpoint metric
-are stored in every `log.txt` row; the full resolved `args` namespace is stored
-in checkpoints. A preset rejects the wrong dataset instead of silently changing
-behavior.
+Every training row records the preset, resolved scope, composition, solver and
+checkpoint metric. Checkpoints store the complete resolved argument namespace.
+The frozen solver also records `counterfactual_solver_v85_frozen = 1.0` in meta
+statistics.
 
-For a controlled comparison, keep initialization, schedule, data split, and
-paired seeds identical. Report at least three seeds for the two V8.7 presets
-and retain these ablations:
-
-1. E2 without bilevel optimization.
-2. CurvPart V7 / Part-only.
-3. AdaCurv V7 / adaptive.
-4. V8.5 competitive.
-5. V8.6 Part-anchored residual.
-
-The complete two-GPU training and evaluation commands are in `README.md`.
+Use identical initialization, schedule, data split and paired seeds. The full
+two-GPU training and evaluation commands are in `README.md`.
