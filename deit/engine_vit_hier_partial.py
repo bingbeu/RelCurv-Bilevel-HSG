@@ -388,8 +388,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         metric_logger.update(sim_loss=sim_loss.item())
         metric_logger.update(part_aux_loss=part_aux_loss.item())
         if meta_stats:
-            for key, value in meta_stats.items():
-                metric_logger.update(**{key: value.item()})
+            metric_logger.update(**meta_stats)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         del feats, caps_embed, caps_model_embed, loss_i, loss_t, sim_loss, logits, support_samples
