@@ -1,4 +1,4 @@
-"""Explicit, reproducible method presets for the V8.7 experiments.
+"""Explicit, reproducible method presets for the V8.7.1 experiments.
 
 The preset is selected by the command line.  Nothing in the model silently
 branches on a dataset name.  Dataset validation exists only to catch an
@@ -16,6 +16,7 @@ METHOD_PRESET_CHOICES = (
     CUB_V85_PRESET,
     AIR_CURVPART_V7_PRESET,
 )
+COUNTERFACTUAL_SOLVER_CHOICES = ("unified", "v85-frozen")
 
 
 _PRESETS: Mapping[str, Tuple[str, Mapping[str, object]]] = {
@@ -26,6 +27,7 @@ _PRESETS: Mapping[str, Tuple[str, Mapping[str, object]]] = {
             "enable_bilevel": True,
             "meta_scope": "counterfactual",
             "counterfactual_compose": "competitive",
+            "counterfactual_solver": "v85-frozen",
             "checkpoint_metric": "fpa",
             "num_parts": 8,
             "semantic_rank": 64,
@@ -79,6 +81,7 @@ _PRESETS: Mapping[str, Tuple[str, Mapping[str, object]]] = {
             "enable_bilevel": True,
             "meta_scope": "part",
             "counterfactual_compose": "competitive",
+            "counterfactual_solver": "unified",
             "checkpoint_metric": "acc1",
             "num_parts": 8,
             "semantic_rank": 64,
@@ -137,6 +140,25 @@ def apply_method_preset(args) -> Dict[str, Tuple[object, object]]:
         if old_value != value:
             changes[name] = (old_value, value)
     return changes
+
+
+def validate_method_configuration(args) -> None:
+    """Reject solver combinations that would defeat execution isolation."""
+    solver = getattr(args, "counterfactual_solver", "unified")
+    if solver not in COUNTERFACTUAL_SOLVER_CHOICES:
+        raise ValueError(
+            "counterfactual solver must be one of "
+            f"{COUNTERFACTUAL_SOLVER_CHOICES}, got {solver!r}"
+        )
+    if solver == "v85-frozen":
+        scope = getattr(args, "meta_scope", None)
+        compose = getattr(args, "counterfactual_compose", None)
+        if scope != "counterfactual" or compose != "competitive":
+            raise ValueError(
+                "counterfactual solver 'v85-frozen' requires "
+                "--meta-scope counterfactual and "
+                "--counterfactual-compose competitive"
+            )
 
 
 def preset_values(name: str) -> Dict[str, object]:
