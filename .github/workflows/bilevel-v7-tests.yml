@@ -1,4 +1,4 @@
-name: Explicit V8.7 preset and bilevel tensor tests
+name: Frozen V8.5 solver V8.7.1 tensor tests
 
 on:
   push:
@@ -12,6 +12,7 @@ on:
       - "codex/consistency-credit-router-v8-5"
       - "codex/part-anchored-residual-v8-6"
       - "codex/dataset-presets-v8-7"
+      - "codex/frozen-v85-solver-v8-7-1"
   pull_request:
 
 jobs:
