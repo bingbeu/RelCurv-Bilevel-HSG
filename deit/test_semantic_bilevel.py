@@ -1,4 +1,4 @@
-"""CPU tests for V8.7.1 frozen-V8.5 and bilevel invariants."""
+"""CPU tests for V8.7.2 frozen-V8.5 and bilevel invariants."""
 
 from argparse import Namespace
 import inspect
@@ -31,7 +31,7 @@ class BilevelSemanticControllerTest(unittest.TestCase):
             relation_hvp_samples=1,
         )
 
-    def test_v871_presets_are_explicit_and_dataset_checked(self):
+    def test_v872_presets_are_explicit_and_dataset_checked(self):
         manual = Namespace(
             method_preset="manual",
             data_set="AIR-HIER",

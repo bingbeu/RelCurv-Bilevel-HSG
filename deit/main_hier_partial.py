@@ -3,10 +3,8 @@
 import os
 import argparse
 import datetime
-import numpy as np
 import time
 import torch
-import torch.backends.cudnn as cudnn
 import json
 
 from pathlib import Path
@@ -36,6 +34,14 @@ from method_presets import (
     METHOD_PRESET_CHOICES,
     apply_method_preset,
     validate_method_configuration,
+)
+from reproducibility import (
+    capture_rng_state,
+    configure_reproducibility,
+    restore_rng_state,
+    restore_scheduler_state,
+    seed_data_worker,
+    validate_run_paths,
 )
 
 
@@ -178,6 +184,21 @@ def get_args_parser():
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument(
+        '--strict-reproducibility', action='store_true',
+        help=('require deterministic algorithms and fully seeded data workers; '
+              'launch Python with PYTHONHASHSEED and CUBLAS_WORKSPACE_CONFIG'),
+    )
+    parser.add_argument(
+        '--allow-resume-best', action='store_true',
+        help=('allow training to fork from best_checkpoint.pth; normal '
+              'interrupted-run continuation must use checkpoint.pth'),
+    )
+    parser.add_argument(
+        '--allow-existing-output', action='store_true',
+        help=('allow a fresh non-resume run to append to an output directory '
+              'that already contains checkpoints or log.txt'),
+    )
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
@@ -206,7 +227,7 @@ def get_args_parser():
     parser.add_argument(
         '--method-preset', default='manual',
         choices=METHOD_PRESET_CHOICES,
-        help=('explicit V8.7.1 experiment preset; cub-v85 freezes the CUB '
+        help=('explicit V8.7.2 experiment preset; cub-v85 freezes the CUB '
               'competitive path and air-curvpart-v7 restores the verified '
               'full-strength Aircraft Part path'),
     )
@@ -371,6 +392,18 @@ def get_args_parser():
 def main(args):
     preset_changes = apply_method_preset(args)
     validate_method_configuration(args)
+    validate_run_paths(
+        args.output_dir,
+        args.resume,
+        eval_only=args.eval,
+        allow_resume_best=args.allow_resume_best,
+        allow_existing_output=args.allow_existing_output,
+    )
+    if args.strict_reproducibility and args.distributed:
+        raise NotImplementedError(
+            "V8.7.2 exact RNG resume currently supports one process per run; "
+            "the documented GPU 6/GPU 7 commands are single-process"
+        )
     if args.method_preset != 'manual':
         changed_names = ', '.join(sorted(preset_changes)) or 'none'
         print(
@@ -399,24 +432,17 @@ def main(args):
             "an ablation with --allow-random-init."
         )
 
-    device = torch.device(args.device)
-
-    # fix the seed for reproducibility
     if args.distributed:
         seed = args.seed + utils.get_rank()
     else:
         seed = args.seed
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    
-    # random.seed(seed)
+    reproducibility = configure_reproducibility(
+        seed,
+        strict=args.strict_reproducibility,
+    )
+    print(f"Reproducibility: {json.dumps(reproducibility, sort_keys=True)}")
 
-    #cudnn.benchmark = True
-
-    cudnn.benchmark = False
-    cudnn.deterministic = True 
-
-
+    device = torch.device(args.device)
 
     dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
     dataset_val, _ = build_dataset_test(is_train=False, args=args)
@@ -455,6 +481,9 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=True,
+        worker_init_fn=(
+            seed_data_worker if args.strict_reproducibility else None
+        ),
     )
     if args.ThreeAugment:
         train_transform = new_data_aug_generator(args)
@@ -467,7 +496,10 @@ def main(args):
         batch_size=int(args.batch_size),
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
-        drop_last=False
+        drop_last=False,
+        worker_init_fn=(
+            seed_data_worker if args.strict_reproducibility else None
+        ),
     )
 
     mixup_fn = None
@@ -671,6 +703,7 @@ def main(args):
     max_accuracy = 0.0
     best_checkpoint_score = float('-inf')
     best_checkpoint_tice = float('inf')
+    resume_rng_restored = False
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -688,7 +721,7 @@ def main(args):
             )
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            restore_scheduler_state(lr_scheduler, checkpoint)
             args.start_epoch = checkpoint['epoch'] + 1
             if args.model_ema:
                 utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
@@ -696,12 +729,21 @@ def main(args):
                 loss_scaler.load_state_dict(checkpoint['scaler'])
             if meta_optimizer is not None and checkpoint.get('meta_optimizer') is not None:
                 meta_optimizer.load_state_dict(checkpoint['meta_optimizer'])
-        lr_scheduler.step(args.start_epoch)
+            resume_rng_restored = restore_rng_state(
+                checkpoint.get('rng_state'),
+                strict=args.strict_reproducibility,
+            )
+            if not resume_rng_restored:
+                print(
+                    "Warning: legacy checkpoint has no RNG snapshot; resumed "
+                    "training will not reproduce an uninterrupted trajectory"
+                )
     if args.eval:
         test_stats = evaluate_detail(data_loader_val, model, device, args.filename, len(args.nb_classes), args.data_set, args.texts)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
 
+    run_start_epoch = args.start_epoch
     print(
         f"Start training for {args.epochs} epochs "
         f"(best checkpoint metric: {checkpoint_metric})"
@@ -738,6 +780,10 @@ def main(args):
         ):
             checkpoint_is_better = True
 
+        # Captured after evaluation: resuming this checkpoint reproduces the
+        # RNG position immediately before the next epoch starts.
+        epoch_rng_state = capture_rng_state()
+
         if checkpoint_is_better:
             best_checkpoint_score = checkpoint_score
             best_checkpoint_tice = checkpoint_tice
@@ -760,6 +806,8 @@ def main(args):
                         'meta_optimizer': (
                             meta_optimizer.state_dict() if meta_optimizer is not None else None
                         ),
+                        'rng_state': epoch_rng_state,
+                        'reproducibility_version': 1,
                         'args': args,
                     }, checkpoint_path)
 
@@ -785,6 +833,8 @@ def main(args):
                         meta_optimizer.state_dict()
                         if meta_optimizer is not None else None
                     ),
+                    'rng_state': epoch_rng_state,
+                    'reproducibility_version': 1,
                     'args': args,
                 }, checkpoint_path)
             
@@ -805,6 +855,13 @@ def main(args):
                      'resolved_counterfactual_solver': (
                          args.counterfactual_solver
                      ),
+                     'strict_reproducibility': (
+                         args.strict_reproducibility
+                     ),
+                     'resume_rng_restored': resume_rng_restored,
+                     'run_start_epoch': run_start_epoch,
+                     'resume_source': args.resume,
+                     'reproducibility_version': 1,
                      'checkpoint_metric': checkpoint_metric}
         
         

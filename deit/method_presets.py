@@ -1,4 +1,4 @@
-"""Explicit, reproducible method presets for the V8.7.1 experiments.
+"""Explicit method presets for the V8.7.2 reproducibility experiments.
 
 The preset is selected by the command line.  Nothing in the model silently
 branches on a dataset name.  Dataset validation exists only to catch an
