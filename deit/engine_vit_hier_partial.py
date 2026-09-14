@@ -201,17 +201,28 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                         build_relations=True,
                     )
                 query_meta_state = query_out[-1]
-                # V8.6 label-free Species trust-region reference.  The
-                # probability is produced by the unmodified query model and
-                # is stopped before any virtual branch is evaluated.
-                query_species_anchor_prob = F.softmax(
-                    query_out[0].detach().float(), dim=-1
-                )
+                # The frozen V8.5 path must not construct the later V8.6
+                # Species-anchor graph.  Every unified path keeps the V8.7
+                # execution sequence, including the frozen Aircraft preset.
+                query_species_anchor_prob = None
+                if args.counterfactual_solver == 'unified':
+                    query_species_anchor_prob = F.softmax(
+                        query_out[0].detach().float(), dim=-1
+                    )
 
             # Meta step: exact hypergradient of the one-step unrolled objective.
             # Only phi (the policy) is updated; theta/psi are untouched here.
             def outer_task_fn(state, fast_params, reference):
                 if args.meta_scope == 'counterfactual':
+                    task_kwargs = dict(
+                        species_to_family=species_to_family,
+                        species_to_order=species_to_order,
+                        consistency_weight=args.meta_consistency_weight,
+                    )
+                    if args.counterfactual_solver == 'unified':
+                        task_kwargs['species_anchor_prob'] = (
+                            query_species_anchor_prob
+                        )
                     return core_model.bilevel_task_losses(
                         state,
                         fast_params,
@@ -221,10 +232,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                         basic_targets,
                         leaf_index,
                         sub_index,
-                        species_to_family=species_to_family,
-                        species_to_order=species_to_order,
-                        consistency_weight=args.meta_consistency_weight,
-                        species_anchor_prob=query_species_anchor_prob,
+                        **task_kwargs,
                     )
                 return core_model.bilevel_task_loss(
                     state,
@@ -271,6 +279,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     consistency_credit_weight=(
                         args.meta_consistency_credit_weight
                     ),
+                    counterfactual_solver=args.counterfactual_solver,
                     counterfactual_compose=args.counterfactual_compose,
                     relation_residual_inner_scale=(
                         args.meta_relation_residual_inner_scale
@@ -308,8 +317,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
 
             # Real model step: p is recomputed after the meta update and detached
             # inside this loss, so no direct weighted-error gradient reaches phi.
-            meta_real_loss, real_stats = core_model.bilevel.real_weighted_alignment(
-                support_meta_state,
+            real_kwargs = dict(
                 scope=args.meta_scope,
                 relation_weight=args.meta_relation_weight,
                 task_level_weights=(
@@ -330,8 +338,21 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                 ),
                 safe_route_budget=args.meta_safe_route_budget,
                 safe_confidence_scale=args.meta_safe_confidence_scale,
-                counterfactual_compose=args.counterfactual_compose,
             )
+            if args.counterfactual_solver == 'v85-frozen':
+                meta_real_loss, real_stats = (
+                    core_model.bilevel.real_weighted_alignment_v85(
+                        support_meta_state, **real_kwargs
+                    )
+                )
+            else:
+                meta_real_loss, real_stats = (
+                    core_model.bilevel.real_weighted_alignment(
+                        support_meta_state,
+                        counterfactual_compose=args.counterfactual_compose,
+                        **real_kwargs,
+                    )
+                )
             meta_stats.update(real_stats)
 
         loss = (
