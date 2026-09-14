@@ -1,4 +1,4 @@
-name: Part-anchored residual counterfactual V8.6 tensor tests
+name: Explicit V8.7 preset and bilevel tensor tests
 
 on:
   push:
@@ -11,6 +11,7 @@ on:
       - "codex/confidence-budget-router-v8-4"
       - "codex/consistency-credit-router-v8-5"
       - "codex/part-anchored-residual-v8-6"
+      - "codex/dataset-presets-v8-7"
   pull_request:
 
 jobs:
