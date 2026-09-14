@@ -18,7 +18,9 @@ for conditional Part/Relation allocation, and credits independently calibrated
 taxonomy-consistency gains in every hierarchy-level route. V8.6 optionally
 anchors every semantic update on Part and treats Relation as a guarded residual,
 so relation consistency credit cannot replace a classification-helpful Part
-update.
+update. V8.7 keeps that residual solver as an ablation and exposes explicit,
+dataset-validated experiment presets: the best observed V8.5 competitive path
+for CUB and the verified Part-only CurvPart V7 path for Aircraft.
 """
 
 import math
