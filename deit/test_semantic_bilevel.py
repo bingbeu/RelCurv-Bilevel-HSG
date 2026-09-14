@@ -1,11 +1,16 @@
-"""CPU tests for V8.7 preset and counterfactual bilevel invariants."""
+"""CPU tests for V8.7.1 frozen-V8.5 and bilevel invariants."""
 
 from argparse import Namespace
+import inspect
 import unittest
 
 import torch
 
-from method_presets import apply_method_preset, preset_values
+from method_presets import (
+    apply_method_preset,
+    preset_values,
+    validate_method_configuration,
+)
 from semantic_bilevel import BilevelSemanticController
 
 
@@ -26,7 +31,7 @@ class BilevelSemanticControllerTest(unittest.TestCase):
             relation_hvp_samples=1,
         )
 
-    def test_v87_presets_are_explicit_and_dataset_checked(self):
+    def test_v871_presets_are_explicit_and_dataset_checked(self):
         manual = Namespace(
             method_preset="manual",
             data_set="AIR-HIER",
@@ -47,6 +52,7 @@ class BilevelSemanticControllerTest(unittest.TestCase):
         self.assertTrue(cub.enable_bilevel)
         self.assertEqual(cub.meta_scope, "counterfactual")
         self.assertEqual(cub.counterfactual_compose, "competitive")
+        self.assertEqual(cub.counterfactual_solver, "v85-frozen")
         self.assertEqual(cub.checkpoint_metric, "fpa")
         self.assertTrue(cub.meta_inner_grad_normalization)
         self.assertAlmostEqual(cub.meta_safe_route_budget, 0.05)
@@ -62,6 +68,7 @@ class BilevelSemanticControllerTest(unittest.TestCase):
         apply_method_preset(air)
         self.assertTrue(air.enable_bilevel)
         self.assertEqual(air.meta_scope, "part")
+        self.assertEqual(air.counterfactual_solver, "unified")
         self.assertEqual(air.checkpoint_metric, "acc1")
         self.assertFalse(air.meta_inner_grad_normalization)
         self.assertAlmostEqual(air.meta_real_weight, 0.1)
@@ -73,6 +80,101 @@ class BilevelSemanticControllerTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "requires --data-set BIRD-HIER"):
             apply_method_preset(wrong_dataset)
+
+        invalid_solver = Namespace(
+            counterfactual_solver="v85-frozen",
+            meta_scope="counterfactual",
+            counterfactual_compose="residual",
+        )
+        with self.assertRaisesRegex(ValueError, "requires"):
+            validate_method_configuration(invalid_solver)
+
+        validate_method_configuration(cub)
+        validate_method_configuration(air)
+
+    def test_frozen_v85_source_preserves_original_operation_order(self):
+        source = inspect.getsource(
+            BilevelSemanticController._counterfactual_meta_objective_v85
+        )
+        relation_policy = source.index(
+            "relation_policy, relation_policy_stats"
+        )
+        part_gradient = source.index("part_grads = torch.autograd.grad")
+        self.assertLess(relation_policy, part_gradient)
+        self.assertNotIn("species_anchor", source)
+
+    def test_frozen_v85_solver_keeps_differentiable_feedback(self):
+        controller = BilevelSemanticController(
+            dim=self.dim,
+            text_dim=24,
+            num_parts=self.parts,
+            semantic_rank=8,
+            adapter_rank=8,
+            policy_hidden_dim=16,
+            reference_mix=0.5,
+            relation_hvp_samples=1,
+            routing_scope="counterfactual",
+        )
+        support = self._state_for(controller, 41, compute_hvp=False)
+        query = self._state_for(controller, 42, compute_hvp=False)
+        targets = torch.randn(self.batch, 3, self.dim)
+
+        def outer_task_fn(state, params, reference):
+            adapted = controller.adapt_parts(
+                state["part_tokens"].detach().float(), params
+            )
+            pooled = (reference.unsqueeze(-1) * adapted).sum(dim=1)
+            losses = torch.stack(
+                [
+                    (pooled - targets[:, level]).square().mean(dim=-1)
+                    for level in range(3)
+                ],
+                dim=1,
+            )
+            return losses, torch.ones_like(losses)
+
+        meta_loss, stats, aux = controller.meta_objective(
+            support,
+            query,
+            inner_lr=0.1,
+            scope="counterfactual",
+            outer_task_fn=outer_task_fn,
+            task_weight=1.0,
+            semantic_weight=0.1,
+            kl_weight=0.0,
+            router_kl_weight=0.0,
+            router_advantage_scale=1.0,
+            normalize_inner_grad=True,
+            safe_improvement_margin=1.0e-5,
+            normalize_router_regret=True,
+            router_regret_floor=1.0e-4,
+            safe_route_budget=0.05,
+            consistency_credit_weight=0.25,
+            counterfactual_compose="competitive",
+            counterfactual_solver="v85-frozen",
+            safe_gate=False,
+            return_aux=True,
+        )
+        policy_grads = torch.autograd.grad(
+            meta_loss,
+            tuple(controller.policy_parameters("counterfactual")),
+            retain_graph=True,
+        )
+        self.assertGreater(
+            sum(grad.abs().sum() for grad in policy_grads).item(), 0.0
+        )
+        self.assertEqual(stats["counterfactual_solver_v85_frozen"], 1.0)
+        self.assertIn("branch_eligibility", aux)
+        self.assertNotIn("species_no_regret_guard", aux)
+
+        real_loss, real_stats = controller.real_weighted_alignment_v85(
+            support,
+            scope="counterfactual",
+            branch_eligibility=aux["branch_eligibility"],
+            branch_confidence=aux["branch_confidence"],
+        )
+        self.assertTrue(torch.isfinite(real_loss))
+        self.assertNotIn("meta_real_residual_mode", real_stats)
 
     def _state(self, seed, compute_hvp=True):
         return self._state_for(self.controller, seed, compute_hvp=compute_hvp)
