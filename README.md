@@ -1,50 +1,36 @@
-# RelCurv-Bilevel-HSG V8.7
+# RelCurv-Bilevel-HSG V8.7.1
 
-**Explicit Dataset-Validated Semantic Presets for Free-Grained Hierarchical
+**Execution-Isolated Dataset Presets for Free-Grained Hierarchical
 Recognition**
 
-V8.7 follows the result of the V8.6 experiment instead of hiding it. The
-part-anchored Relation residual reduced FPA on both datasets, suppressed the
-Relation route by 89--96%, and reduced the meta-policy gradient by about 69%.
-The residual path is therefore retained only as an ablation.
+V8.7 produced the strongest observed Aircraft trade-off (`70.387` FPA and
+`9.541` TICE), but the CUB `cub-v85` preset did not reproduce the original
+V8.5 trajectory. The two runs were identical through epoch 4 and diverged
+exactly when bilevel optimization started at epoch 5. Code inspection showed
+that V8.6 had reordered shared competitive/residual operations even though the
+competitive equations remained mathematically equivalent.
 
-The recommended experiment now uses two explicit, reproducible presets:
+V8.7.1 therefore separates the solvers at execution level:
 
-| Dataset | Preset | Resolved method | Checkpoint metric |
+| Dataset | Preset | Solver | Checkpoint metric |
 |---|---|---|---|
-| CUB (`BIRD-HIER`) | `cub-v85` | V8.5 all-level competitive counterfactual routing | FPA |
-| Aircraft (`AIR-HIER`) | `air-curvpart-v7` | CurvPart V7 full-strength Part task-feedback | Species Acc@1 |
+| CUB (`BIRD-HIER`) | `cub-v85` | byte-matched frozen V8.5 competitive solver | FPA |
+| Aircraft (`AIR-HIER`) | `air-curvpart-v7` | unchanged V8.7 full-strength Part path | Species Acc@1 |
 
-The preset must be selected on the command line. The model never silently
-branches on a dataset name. A dataset compatibility check only prevents an
-accidental command mismatch. The selected preset and resolved scope are saved
-in checkpoints and written into every `log.txt` row.
+The CUB preset now resolves `--counterfactual-solver v85-frozen`. Its task
+output validator, competitive meta solver and real semantic update are copied
+from the original V8.5 source with the original tensor-operation order. It does
+not construct the later Species-anchor graph or residual intermediates.
 
-## Resolved preset invariants
+The Aircraft preset remains unchanged: it constructs no Relation encoder,
+Relation policy or router; its real Part weight is one and its query objective
+still covers Species, Family and Order. “Part-only” describes the semantic
+update type, not a fine-level-only task.
 
-`cub-v85` freezes the best observed CUB path:
-
-- `--meta-scope counterfactual`
-- `--counterfactual-compose competitive`
-- independent Skip/Part/Relation virtual branches at Species, Family and Order
-- normalized virtual steps, fixed 5% safe non-Skip budget and consistency credit
-- FPA checkpoint selection
-
-`air-curvpart-v7` restores the verified Aircraft path:
-
-- `--meta-scope part`
-- raw one-step Part inner gradient, matching CurvPart-HSG V7
-- full real Part route (`meta_real_part_weight = 1`), rather than a gated
-  1--2% counterfactual route
-- no Relation encoder, Relation policy or granularity router is constructed
-- Species/Family/Order task-feedback remains in the query objective
-- Species Acc@1 checkpoint selection, matching the historical V7 protocol
-
-Both methods remain hierarchical: neither preset restricts learning to only a
-fine or only a coarse level.
-
-See [`BILEVEL_SEMANTIC_LOOP.md`](BILEVEL_SEMANTIC_LOOP.md) for the separation
-and optimization invariants.
+The selection is explicit on the command line. Dataset validation catches an
+accidental preset mismatch; the model never silently selects a method from a
+dataset name. See [`BILEVEL_SEMANTIC_LOOP.md`](BILEVEL_SEMANTIC_LOOP.md) for
+the optimization invariants.
 
 ## Installation
 
@@ -59,18 +45,21 @@ pip install torch==2.1.2 torchvision==0.16.2 \
 export PYTHONPATH=deit/:deit/dataset/:$PYTHONPATH
 ```
 
-Place `deit_small_patch16_224-cd65a155.pth` in the repository root. Start both
-controlled runs from this same pretrained checkpoint; do not resume a V8.5 or
-V8.6 optimizer state.
+Place `deit_small_patch16_224-cd65a155.pth` in the repository root. Both fresh
+runs must start from that checkpoint; do not resume a V8.5--V8.7 optimizer
+state.
 
 ## Training on two separate GPUs
 
 Run Aircraft in one terminal on GPU 7 and CUB in another terminal on GPU 6.
 
-### Aircraft / CurvPart V7 preset on GPU 7
+### Aircraft / unchanged V8.7 Part path on GPU 7
+
+The existing `air_v87_curvpart_v7_seed0/best_checkpoint.pth` remains valid. A
+fresh controlled run uses:
 
 ```bash
-mkdir -p ./output/air_v87_curvpart_v7_seed0
+mkdir -p ./output/air_v871_curvpart_v7_seed0
 
 CUDA_VISIBLE_DEVICES=7 python deit/main_hier_partial.py \
   --method-preset air-curvpart-v7 \
@@ -80,18 +69,18 @@ CUDA_VISIBLE_DEVICES=7 python deit/main_hier_partial.py \
   --seed 0 --random_seed 0 \
   --data-set AIR-HIER \
   --data-path /raid/datasets/fgvc-aircraft \
-  --output_dir ./output/air_v87_curvpart_v7_seed0 \
+  --output_dir ./output/air_v871_curvpart_v7_seed0 \
   --filename final_epoch_eval.csv \
   --texts captions/air_caps.txt --sim_loss_weight 1 \
   --sp_proportion 0.3 --fm_proportion 0.6 \
   --finetune deit_small_patch16_224-cd65a155.pth \
-  2>&1 | tee ./output/air_v87_curvpart_v7_seed0/train.log
+  2>&1 | tee ./output/air_v871_curvpart_v7_seed0/train.log
 ```
 
-### CUB / V8.5 competitive preset on GPU 6
+### CUB / execution-frozen V8.5 solver on GPU 6
 
 ```bash
-mkdir -p ./output/bird_v87_cub_v85_seed0
+mkdir -p ./output/bird_v871_frozen_v85_seed0
 
 CUDA_VISIBLE_DEVICES=6 python deit/main_hier_partial.py \
   --method-preset cub-v85 \
@@ -101,108 +90,107 @@ CUDA_VISIBLE_DEVICES=6 python deit/main_hier_partial.py \
   --seed 0 --random_seed 0 \
   --data-set BIRD-HIER \
   --data-path /raid/datasets/cub-200/CUB_200_2011/images_split \
-  --output_dir ./output/bird_v87_cub_v85_seed0 \
+  --output_dir ./output/bird_v871_frozen_v85_seed0 \
   --filename final_epoch_eval.csv \
   --texts captions/cub_caps.txt --sim_loss_weight 1 \
   --sp_proportion 0.1 --fm_proportion 0.5 \
   --finetune deit_small_patch16_224-cd65a155.pth \
-  2>&1 | tee ./output/bird_v87_cub_v85_seed0/train.log
+  2>&1 | tee ./output/bird_v871_frozen_v85_seed0/train.log
 ```
 
-The preset resolves the complete method configuration before the model and
-optimizers are created. Any conflicting method flags on the same command are
-overridden and printed once at startup.
-
-## Evaluation commands
-
-Evaluation loads the complete checkpoint with `--resume`. Do not add
-`--finetune`.
-
-### Aircraft evaluation on GPU 7
-
-```bash
-mkdir -p ./output/air_v87_curvpart_v7_seed0
-
-CUDA_VISIBLE_DEVICES=7 python deit/main_hier_partial.py \
-  --method-preset air-curvpart-v7 \
-  --model deit_small_patch16_224 \
-  --batch-size 256 --num_workers 8 \
-  --data-set AIR-HIER \
-  --data-path /raid/datasets/fgvc-aircraft \
-  --output_dir ./output/air_v87_curvpart_v7_seed0 \
-  --texts captions/air_caps.txt \
-  --sp_proportion 0.3 --fm_proportion 0.6 \
-  --seed 0 --random_seed 0 \
-  --resume ./output/air_v87_curvpart_v7_seed0/best_checkpoint.pth \
-  --filename ./output/air_v87_curvpart_v7_seed0/eval_detail.csv \
-  --eval 2>&1 | tee ./output/air_v87_curvpart_v7_seed0/test_eval.log
-```
-
-### CUB evaluation on GPU 6
-
-```bash
-mkdir -p ./output/bird_v87_cub_v85_seed0
-
-CUDA_VISIBLE_DEVICES=6 python deit/main_hier_partial.py \
-  --method-preset cub-v85 \
-  --model deit_small_patch16_224 \
-  --batch-size 256 --num_workers 8 \
-  --data-set BIRD-HIER \
-  --data-path /raid/datasets/cub-200/CUB_200_2011/images_split \
-  --output_dir ./output/bird_v87_cub_v85_seed0 \
-  --texts captions/cub_caps.txt \
-  --sp_proportion 0.1 --fm_proportion 0.5 \
-  --seed 0 --random_seed 0 \
-  --resume ./output/bird_v87_cub_v85_seed0/best_checkpoint.pth \
-  --filename ./output/bird_v87_cub_v85_seed0/eval_detail.csv \
-  --eval 2>&1 | tee ./output/bird_v87_cub_v85_seed0/test_eval.log
-```
-
-## Verify the resolved method
-
-At startup, Aircraft must print values equivalent to:
-
-```text
-method_preset='air-curvpart-v7'
-meta_scope='part'
-checkpoint_metric='acc1'
-meta_inner_grad_normalization=False
-```
-
-CUB must print:
+At startup, CUB must print values equivalent to:
 
 ```text
 method_preset='cub-v85'
 meta_scope='counterfactual'
 counterfactual_compose='competitive'
+counterfactual_solver='v85-frozen'
 checkpoint_metric='fpa'
 ```
 
-After training, verify the recorded configuration:
+## Evaluation commands
+
+Evaluation loads the complete checkpoint using `--resume`; do not add
+`--finetune`.
+
+### Aircraft evaluation on GPU 7
 
 ```bash
-tail -n 1 ./output/air_v87_curvpart_v7_seed0/log.txt | \
-  grep -o '"method_preset"[^,]*\|"resolved_meta_scope"[^,]*\|"checkpoint_metric"[^,]*'
+mkdir -p ./output/air_v871_curvpart_v7_seed0
 
-tail -n 1 ./output/bird_v87_cub_v85_seed0/log.txt | \
-  grep -o '"method_preset"[^,]*\|"resolved_meta_scope"[^,]*\|"resolved_counterfactual_compose"[^,]*\|"checkpoint_metric"[^,]*'
+CUDA_VISIBLE_DEVICES=7 python deit/main_hier_partial.py \
+  --method-preset air-curvpart-v7 \
+  --model deit_small_patch16_224 \
+  --batch-size 256 --num_workers 8 \
+  --data-set AIR-HIER \
+  --data-path /raid/datasets/fgvc-aircraft \
+  --output_dir ./output/air_v871_curvpart_v7_seed0 \
+  --texts captions/air_caps.txt \
+  --sp_proportion 0.3 --fm_proportion 0.6 \
+  --seed 0 --random_seed 0 \
+  --resume ./output/air_v871_curvpart_v7_seed0/best_checkpoint.pth \
+  --filename ./output/air_v871_curvpart_v7_seed0/eval_detail.csv \
+  --eval 2>&1 | tee ./output/air_v871_curvpart_v7_seed0/test_eval.log
+```
+
+To evaluate the already completed V8.7 Aircraft run instead, replace every
+`air_v871_curvpart_v7_seed0` above with `air_v87_curvpart_v7_seed0`.
+
+### CUB evaluation on GPU 6
+
+```bash
+mkdir -p ./output/bird_v871_frozen_v85_seed0
+
+CUDA_VISIBLE_DEVICES=6 python deit/main_hier_partial.py \
+  --method-preset cub-v85 \
+  --model deit_small_patch16_224 \
+  --batch-size 256 --num_workers 8 \
+  --data-set BIRD-HIER \
+  --data-path /raid/datasets/cub-200/CUB_200_2011/images_split \
+  --output_dir ./output/bird_v871_frozen_v85_seed0 \
+  --texts captions/cub_caps.txt \
+  --sp_proportion 0.1 --fm_proportion 0.5 \
+  --seed 0 --random_seed 0 \
+  --resume ./output/bird_v871_frozen_v85_seed0/best_checkpoint.pth \
+  --filename ./output/bird_v871_frozen_v85_seed0/eval_detail.csv \
+  --eval 2>&1 | tee ./output/bird_v871_frozen_v85_seed0/test_eval.log
+```
+
+## Verify solver selection
+
+```bash
+tail -n 1 ./output/bird_v871_frozen_v85_seed0/log.txt | \
+  grep -o '"method_preset"[^,]*\|"resolved_meta_scope"[^,]*\|"resolved_counterfactual_compose"[^,]*\|"resolved_counterfactual_solver"[^,]*\|"checkpoint_metric"[^,]*'
+
+tail -n 1 ./output/air_v871_curvpart_v7_seed0/log.txt | \
+  grep -o '"method_preset"[^,]*\|"resolved_meta_scope"[^,]*\|"resolved_counterfactual_solver"[^,]*\|"checkpoint_metric"[^,]*'
+```
+
+`cub-v85` should also log:
+
+```text
+train_counterfactual_solver_v85_frozen: 1.0
 ```
 
 ## Manual and ablation modes
 
-`--method-preset manual` is the default and preserves every existing V7--V8.6
-command. In particular, V8.6 residual remains available as an ablation:
+`--method-preset manual` preserves prior commands. Solver combinations are
+explicitly validated:
 
 ```bash
---method-preset manual \
---enable-bilevel \
+# Original V8.5 execution path
+--counterfactual-solver v85-frozen \
+--meta-scope counterfactual \
+--counterfactual-compose competitive
+
+# V8.6 residual-capable path
+--counterfactual-solver unified \
 --meta-scope counterfactual \
 --counterfactual-compose residual
 ```
 
-Do not present the two recommended presets as per-sample automatic routing.
-They are dataset-wise configurations and must be selected using validation
-data. For formal claims, run at least three paired seeds.
+`v85-frozen` rejects residual composition. For formal claims, select presets
+using validation data and report at least three paired seeds.
 
 ## Verification
 
