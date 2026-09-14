@@ -18,9 +18,9 @@ for conditional Part/Relation allocation, and credits independently calibrated
 taxonomy-consistency gains in every hierarchy-level route. V8.6 optionally
 anchors every semantic update on Part and treats Relation as a guarded residual,
 so relation consistency credit cannot replace a classification-helpful Part
-update. V8.7 keeps that residual solver as an ablation and exposes explicit,
-dataset-validated experiment presets: the best observed V8.5 competitive path
-for CUB and the verified Part-only CurvPart V7 path for Aircraft.
+update. V8.7 exposes explicit dataset presets. V8.7.1 additionally freezes the
+original V8.5 competitive tensor-operation order for CUB while leaving the
+verified Part-only Aircraft path unchanged.
 """
 
 import math
@@ -964,6 +964,609 @@ class BilevelSemanticController(nn.Module):
             part_loss + float(relation_weight) * relation_loss
         ) / max(normalizer, 1.0)
 
+    # Frozen operational V8.5 path. Keep this method independent from the
+    # residual solver: even mathematically equivalent operation reordering
+    # changed the deterministic training trajectory after meta-start-epoch.
+    @staticmethod
+    def _task_output_v85(
+        value,
+        batch_size: int,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        """Validate an all-level outer evaluator and expose route credits.
+
+        Counterfactual routing needs unreduced losses so the support/query pair
+        keeps its own route.  A rich dictionary may additionally separate
+        supervised classification and hierarchy-consistency losses.  Legacy
+        ``(losses, mask)`` evaluators remain valid and receive zero independent
+        consistency credit.
+        """
+        if isinstance(value, dict):
+            losses = value.get("losses")
+            mask = value.get("mask")
+            classification_losses = value.get("classification_losses", losses)
+            consistency_losses = value.get("consistency_losses")
+        elif isinstance(value, (tuple, list)) and len(value) == 2:
+            losses, mask = value
+            classification_losses = losses
+            consistency_losses = None
+        else:
+            raise TypeError(
+                "counterfactual outer_task_fn must return (losses, mask) or "
+                "a component dictionary with shape (B, 3)"
+            )
+        if not isinstance(losses, torch.Tensor) or not isinstance(mask, torch.Tensor):
+            raise TypeError("counterfactual task losses and mask must be tensors")
+        if tuple(losses.shape) != (batch_size, 3):
+            raise ValueError(
+                "counterfactual task losses must have shape "
+                f"({batch_size}, 3), got {tuple(losses.shape)}"
+            )
+        if tuple(mask.shape) != tuple(losses.shape):
+            raise ValueError("counterfactual task mask must match task losses")
+        if not isinstance(classification_losses, torch.Tensor):
+            raise TypeError("counterfactual classification losses must be a tensor")
+        if tuple(classification_losses.shape) != tuple(losses.shape):
+            raise ValueError(
+                "counterfactual classification losses must match task losses"
+            )
+        if consistency_losses is None:
+            consistency_losses = torch.zeros_like(losses)
+        if not isinstance(consistency_losses, torch.Tensor):
+            raise TypeError("counterfactual consistency losses must be a tensor")
+        if tuple(consistency_losses.shape) != tuple(losses.shape):
+            raise ValueError(
+                "counterfactual consistency losses must match task losses"
+            )
+        return (
+            losses.float(),
+            mask.to(device=losses.device, dtype=losses.dtype),
+            classification_losses.float(),
+            consistency_losses.float(),
+        )
+
+    def _counterfactual_meta_objective_v85(
+        self,
+        support: Dict[str, torch.Tensor],
+        query: Dict[str, torch.Tensor],
+        inner_lr: float,
+        q_mode: str,
+        kl_weight: float,
+        relation_weight: float,
+        outer_task_fn: Callable,
+        task_weight: float,
+        semantic_weight: float,
+        router_kl_weight: float,
+        task_level_weights: Tuple[float, float, float],
+        router_advantage_scale: float,
+        normalize_inner_grad: bool,
+        safe_improvement_margin: float,
+        normalize_router_regret: bool,
+        router_regret_floor: float,
+        safe_route_budget: float,
+        safe_confidence_scale: float,
+        safe_confidence_budget: bool,
+        consistency_credit_weight: float,
+        safe_gate: bool,
+    ):
+        """Three virtual branches evaluated independently at all three levels."""
+        if not self.enable_relations:
+            raise RuntimeError("counterfactual routing requires relation evidence")
+        if self.router.num_tasks != 3:
+            raise RuntimeError(
+                "controller was not constructed with routing_scope='counterfactual'"
+            )
+        if outer_task_fn is None:
+            raise RuntimeError("counterfactual routing requires an outer task evaluator")
+        if router_advantage_scale < 0:
+            raise ValueError("router_advantage_scale must be nonnegative")
+        if safe_improvement_margin < 0:
+            raise ValueError("safe improvement margin must be nonnegative")
+        if router_regret_floor <= 0:
+            raise ValueError("router regret floor must be positive")
+        if not 0.0 <= float(safe_route_budget) <= 1.0:
+            raise ValueError("safe route budget must be in [0, 1]")
+        if safe_confidence_scale <= 0:
+            raise ValueError("safe confidence scale must be positive")
+        if consistency_credit_weight < 0:
+            raise ValueError("consistency credit weight must be nonnegative")
+
+        level_weights = torch.as_tensor(
+            task_level_weights, dtype=torch.float32,
+            device=support["part_tokens"].device,
+        )
+        if level_weights.numel() != 3 or (level_weights < 0).any():
+            raise ValueError("task_level_weights must contain three nonnegative values")
+        if float(level_weights.sum()) <= 0:
+            raise ValueError("at least one task-level weight must be positive")
+
+        support_tokens = support["part_tokens"].detach().float()
+        support_target = support["target_semantics"].detach().float()
+        support_curvature = support["curvature"].detach().float()
+        base_params = OrderedDict(self.adapter.named_parameters())
+        support_adapted = self.adapt_parts(support_tokens, base_params)
+
+        part_error = self._direct_alignment_error(support_adapted, support_target)
+        part_policy, part_policy_stats = self.policy(
+            support_tokens,
+            support["policy_semantics"].detach().float(),
+            support_curvature,
+        )
+        part_inner_per_example = (
+            self.num_parts * part_policy * part_error
+        ).mean(dim=1)
+        part_kl = self._policy_kl(part_policy)
+
+        support_relation = support["relation_state"]
+        relation_tokens = self.relation_encoder.visual_relations(
+            support_adapted,
+            support_relation["part_attn"].detach().float(),
+        )[0]
+        relation_error = self.relation_alignment_error(
+            relation_tokens,
+            support_relation["target_semantics"].detach().float(),
+        )
+        relation_curvature = support_relation["curvature"].detach().float()
+        relation_policy, relation_policy_stats = self.relation_policy(
+            relation_tokens.detach(),
+            support_relation["policy_semantics"].detach().float(),
+            relation_curvature,
+        )
+        relation_inner_per_example = (
+            self.num_relations * relation_policy * relation_error
+        ).mean(dim=1)
+        relation_kl = self._policy_kl(relation_policy)
+
+        # Each update is unrolled separately.  No route probability is allowed
+        # to mix the inner losses before their causal effect is observed.
+        base_values = tuple(base_params.values())
+        part_grads = torch.autograd.grad(
+            part_inner_per_example.mean(), base_values,
+            create_graph=True, retain_graph=True, allow_unused=False,
+        )
+        relation_grads = torch.autograd.grad(
+            float(relation_weight) * relation_inner_per_example.mean(),
+            base_values, create_graph=True, allow_unused=False,
+        )
+        part_fast_params, part_grad_norm, part_step_norm = (
+            self._counterfactual_fast_params(
+                base_params, part_grads, inner_lr, normalize_inner_grad
+            )
+        )
+        relation_fast_params, relation_grad_norm, relation_step_norm = (
+            self._counterfactual_fast_params(
+                base_params, relation_grads, inner_lr, normalize_inner_grad
+            )
+        )
+        branch_params = (
+            base_params,
+            part_fast_params,
+            relation_fast_params,
+        )
+
+        route, route_stats = self.router(
+            part_error,
+            relation_error,
+            support_curvature,
+            relation_curvature,
+        )
+
+        # A single stopped reference is shared by all branches; otherwise a
+        # branch could look better merely by changing how it is evaluated.
+        query_tokens = query["part_tokens"].detach().float()
+        query_target = query["target_semantics"].detach().float()
+        query_part_base = self.alignment_error(
+            query_tokens, query_target, base_params
+        )
+        q_part = self.reference_distribution(
+            query_part_base, query["curvature"].detach().float(), q_mode
+        )
+        query_relation = query["relation_state"]
+        query_relation_base_tokens = self._relation_tokens(
+            query_relation, base_params
+        )
+        query_relation_base = self.relation_alignment_error(
+            query_relation_base_tokens,
+            query_relation["target_semantics"].detach().float(),
+        )
+        q_relation = self.reference_distribution(
+            query_relation_base,
+            query_relation["curvature"].detach().float(),
+            q_mode,
+        )
+
+        task_branches = []
+        classification_branches = []
+        consistency_branches = []
+        align_branches = []
+        task_mask = None
+        batch_size = support_tokens.size(0)
+        for params in branch_params:
+            (
+                task_losses,
+                branch_mask,
+                classification_losses,
+                consistency_losses,
+            ) = self._task_output_v85(
+                outer_task_fn(query, params, q_part), batch_size
+            )
+            if task_mask is None:
+                task_mask = branch_mask
+            elif not torch.equal(task_mask.bool(), branch_mask.bool()):
+                raise ValueError("all counterfactual branches must use the same task mask")
+            task_branches.append(task_losses)
+            classification_branches.append(classification_losses)
+            consistency_branches.append(consistency_losses)
+            align_branches.append(self._counterfactual_alignment(
+                query, params, q_part, q_relation, relation_weight
+            ))
+
+        # (B, task, branch), with branch order skip/part/relation.
+        branch_task_loss = torch.stack(task_branches, dim=-1)
+        branch_classification_loss = torch.stack(
+            classification_branches, dim=-1
+        )
+        branch_consistency_loss = torch.stack(
+            consistency_branches, dim=-1
+        )
+        branch_align_loss = torch.stack(align_branches, dim=-1)
+        weighted_mask = task_mask * level_weights.view(1, 3)
+
+        def weighted_task_reduce(value: torch.Tensor) -> torch.Tensor:
+            task_means = (
+                (value * task_mask).sum(dim=0)
+                / task_mask.sum(dim=0).clamp_min(1.0)
+            )
+            return (level_weights * task_means).sum()
+
+        # Classification and hierarchy consistency have very different raw
+        # scales.  Calibrate their branch regrets independently before adding
+        # consistency credit; otherwise CE can hide a relation update that
+        # improves Species/Family/Order agreement.
+        skip_classification = branch_classification_loss[:, :, 0].detach()
+        classification_relative_regret = (
+            branch_classification_loss - skip_classification.unsqueeze(-1)
+        ) / skip_classification.abs().unsqueeze(-1).clamp_min(1.0e-3)
+        classification_relative_regret = classification_relative_regret.clamp(
+            min=-10.0, max=10.0
+        )
+        skip_consistency = branch_consistency_loss[:, :, 0].detach()
+        consistency_relative_regret = (
+            branch_consistency_loss - skip_consistency.unsqueeze(-1)
+        ) / skip_consistency.abs().unsqueeze(-1).clamp_min(1.0e-3)
+        consistency_relative_regret = consistency_relative_regret.clamp(
+            min=-10.0, max=10.0
+        )
+        (
+            calibrated_classification_regret,
+            classification_regret_rms,
+        ) = self._calibrate_counterfactual_regret(
+            classification_relative_regret,
+            improvement_margin=safe_improvement_margin,
+            scale_floor=router_regret_floor,
+            normalize=normalize_router_regret,
+        )
+        (
+            calibrated_consistency_regret,
+            consistency_regret_rms,
+        ) = self._calibrate_counterfactual_regret(
+            consistency_relative_regret,
+            improvement_margin=0.0,
+            scale_floor=router_regret_floor,
+            normalize=normalize_router_regret,
+        )
+        calibrated_regret = (
+            calibrated_classification_regret
+            + float(consistency_credit_weight)
+            * calibrated_consistency_regret
+        )
+        relative_regret = (
+            classification_relative_regret
+            + float(consistency_credit_weight) * consistency_relative_regret
+        )
+        regret_rms = torch.sqrt(
+            classification_regret_rms.square()
+            + (
+                float(consistency_credit_weight) * consistency_regret_rms
+            ).square()
+        )
+        if normalize_router_regret:
+            confidence_regret = calibrated_regret
+        else:
+            normalized_classification_regret, _ = (
+                self._calibrate_counterfactual_regret(
+                    classification_relative_regret,
+                    improvement_margin=safe_improvement_margin,
+                    scale_floor=router_regret_floor,
+                    normalize=True,
+                )
+            )
+            normalized_consistency_regret, _ = (
+                self._calibrate_counterfactual_regret(
+                    consistency_relative_regret,
+                    improvement_margin=0.0,
+                    scale_floor=router_regret_floor,
+                    normalize=True,
+                )
+            )
+            confidence_regret = (
+                normalized_classification_regret
+                + float(consistency_credit_weight)
+                * normalized_consistency_regret
+            )
+        # The stopped gate owns the Skip decision.  The learned router is
+        # conditioned on semantic updates and can only choose Part versus
+        # Relation.  This prevents expected-regret training from escaping into
+        # the global all-Skip solution observed in V8.1/V8.2.
+        combined_gain = -calibrated_regret.detach()[:, :, 1:]
+        branch_confidence = (
+            -confidence_regret.detach()[:, :, 1:]
+        ).clamp_min(0.0)
+        branch_eligibility = (
+            (combined_gain > 0.0)
+            & task_mask.bool().unsqueeze(-1)
+        )
+        route_eligibility = branch_eligibility if safe_gate else None
+        route_confidence = (
+            branch_confidence
+            if safe_gate and safe_confidence_budget
+            else None
+        )
+        (
+            two_stage_route,
+            conditional_route,
+            has_eligible,
+            effective_budget,
+        ) = self._two_stage_counterfactual_route(
+            route,
+            route_eligibility,
+            non_skip_budget=safe_route_budget,
+            branch_confidence=route_confidence,
+            confidence_scale=safe_confidence_scale,
+        )
+        best_branch = calibrated_regret.detach().argmin(dim=-1)
+
+        expected_task_per_level = (
+            two_stage_route * branch_task_loss
+        ).sum(dim=-1)
+        outer_task = weighted_task_reduce(expected_task_per_level)
+        task_before = weighted_task_reduce(branch_task_loss[:, :, 0])
+        raw_expected_regret = (
+            two_stage_route * relative_regret
+        ).sum(dim=-1)
+        raw_router_objective = weighted_task_reduce(raw_expected_regret)
+        expected_regret = (
+            two_stage_route * calibrated_regret
+        ).sum(dim=-1)
+        router_objective = weighted_task_reduce(expected_regret)
+
+        # Convert task-specific routes into one per-example semantic route only
+        # for the auxiliary alignment evaluator.  Classification routing remains
+        # fully task-specific above.
+        route_weight = weighted_mask / weighted_mask.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1.0)
+        semantic_route = (
+            route_weight.unsqueeze(-1) * two_stage_route
+        ).sum(dim=1)
+        outer_align = (semantic_route * branch_align_loss).sum(dim=-1).mean()
+        align_before = branch_align_loss[:, 0].mean()
+
+        prior = self.router.prior.to(route)
+        conditional_prior = prior[1:] / prior[1:].sum().clamp_min(1.0e-8)
+        conditional_kl = (
+            conditional_route * (
+                conditional_route.clamp_min(1.0e-8).log()
+                - conditional_prior.clamp_min(1.0e-8).log()
+            )
+        ).sum(dim=-1)
+        router_kl = weighted_task_reduce(conditional_kl)
+        meta_loss = (
+            float(task_weight) * (
+                outer_task + float(router_advantage_scale) * router_objective
+            )
+            + float(semantic_weight) * outer_align
+            + float(kl_weight) * (part_kl + relation_kl)
+            + float(router_kl_weight) * router_kl
+        )
+
+        def masked_level_mean(value: torch.Tensor, task_idx: int) -> torch.Tensor:
+            mask = task_mask[:, task_idx]
+            return (value[:, task_idx] * mask).sum() / mask.sum().clamp_min(1.0)
+
+        route_denominator = task_mask.sum().clamp_min(1.0)
+
+        stats: Dict[str, torch.Tensor] = {
+            "meta_loss": meta_loss.detach(),
+            "meta_inner_align": (
+                0.5 * (
+                    part_inner_per_example.mean()
+                    + float(relation_weight) * relation_inner_per_example.mean()
+                )
+            ).detach(),
+            "meta_outer_task": outer_task.detach(),
+            "meta_task_improvement": (task_before - outer_task).detach(),
+            "meta_task_improvement_x1e4": (
+                task_before - outer_task
+            ).detach() * 1.0e4,
+            "meta_router_objective": router_objective.detach(),
+            "meta_router_raw_objective": raw_router_objective.detach(),
+            "meta_router_regret_rms": (
+                regret_rms.squeeze(-1) * task_mask
+            ).sum().div(task_mask.sum().clamp_min(1.0)).detach(),
+            "meta_router_classification_regret_rms": (
+                classification_regret_rms.squeeze(-1) * task_mask
+            ).sum().div(task_mask.sum().clamp_min(1.0)).detach(),
+            "meta_router_consistency_regret_rms": (
+                consistency_regret_rms.squeeze(-1) * task_mask
+            ).sum().div(task_mask.sum().clamp_min(1.0)).detach(),
+            "meta_router_consistency_credit_weight": calibrated_regret.new_tensor(
+                float(consistency_credit_weight)
+            ).detach(),
+            "meta_router_calibrated_abs": (
+                calibrated_regret.detach().abs().mean(dim=-1) * task_mask
+            ).sum().div(task_mask.sum().clamp_min(1.0)).detach(),
+            "meta_part_inner_grad_norm": part_grad_norm.detach(),
+            "meta_relation_inner_grad_norm": relation_grad_norm.detach(),
+            "meta_part_inner_step_norm": part_step_norm.detach(),
+            "meta_relation_inner_step_norm": relation_step_norm.detach(),
+            "meta_outer_align": outer_align.detach(),
+            "meta_improvement": (align_before - outer_align).detach(),
+            "meta_policy_kl": (part_kl + relation_kl).detach(),
+            "meta_router_kl": router_kl.detach(),
+            "two_stage_route_skip": (
+                two_stage_route[:, :, 0] * task_mask
+            ).sum().div(route_denominator).detach(),
+            "two_stage_route_part": (
+                two_stage_route[:, :, 1] * task_mask
+            ).sum().div(route_denominator).detach(),
+            "two_stage_route_relation": (
+                two_stage_route[:, :, 2] * task_mask
+            ).sum().div(route_denominator).detach(),
+            "two_stage_active_rate": (
+                has_eligible.float() * task_mask
+            ).sum().div(route_denominator).detach(),
+            "two_stage_effective_budget": (
+                effective_budget * task_mask
+            ).sum().div(route_denominator).detach(),
+            "two_stage_gain_confidence": (
+                branch_confidence.max(dim=-1).values * task_mask
+            ).sum().div(route_denominator).detach(),
+        }
+        task_names = AdaptiveGranularityRouter.TASK_NAMES
+        for task_idx, task_name in enumerate(task_names):
+            skip_value = masked_level_mean(branch_task_loss[:, :, 0], task_idx)
+            part_value = masked_level_mean(branch_task_loss[:, :, 1], task_idx)
+            relation_value = masked_level_mean(branch_task_loss[:, :, 2], task_idx)
+            skip_classification_value = masked_level_mean(
+                branch_classification_loss[:, :, 0], task_idx
+            )
+            part_classification_value = masked_level_mean(
+                branch_classification_loss[:, :, 1], task_idx
+            )
+            relation_classification_value = masked_level_mean(
+                branch_classification_loss[:, :, 2], task_idx
+            )
+            skip_consistency_value = masked_level_mean(
+                branch_consistency_loss[:, :, 0], task_idx
+            )
+            part_consistency_value = masked_level_mean(
+                branch_consistency_loss[:, :, 1], task_idx
+            )
+            relation_consistency_value = masked_level_mean(
+                branch_consistency_loss[:, :, 2], task_idx
+            )
+            stats.update({
+                f"meta_{task_name}_skip_task": skip_value.detach(),
+                f"meta_{task_name}_part_task": part_value.detach(),
+                f"meta_{task_name}_relation_task": relation_value.detach(),
+                f"meta_{task_name}_part_improvement": (
+                    skip_value - part_value
+                ).detach(),
+                f"meta_{task_name}_relation_improvement": (
+                    skip_value - relation_value
+                ).detach(),
+                f"meta_{task_name}_part_classification_improvement": (
+                    skip_classification_value - part_classification_value
+                ).detach(),
+                f"meta_{task_name}_relation_classification_improvement": (
+                    skip_classification_value - relation_classification_value
+                ).detach(),
+                f"meta_{task_name}_part_consistency_improvement": (
+                    skip_consistency_value - part_consistency_value
+                ).detach(),
+                f"meta_{task_name}_relation_consistency_improvement": (
+                    skip_consistency_value - relation_consistency_value
+                ).detach(),
+                f"safe_{task_name}_part_accept_rate": (
+                    branch_eligibility[:, task_idx, 0].float()
+                    * task_mask[:, task_idx]
+                ).sum().div(task_mask[:, task_idx].sum().clamp_min(1.0)).detach(),
+                f"safe_{task_name}_relation_accept_rate": (
+                    branch_eligibility[:, task_idx, 1].float()
+                    * task_mask[:, task_idx]
+                ).sum().div(task_mask[:, task_idx].sum().clamp_min(1.0)).detach(),
+                f"conditional_{task_name}_part": masked_level_mean(
+                    conditional_route[:, :, 0], task_idx
+                ).detach(),
+                f"conditional_{task_name}_relation": masked_level_mean(
+                    conditional_route[:, :, 1], task_idx
+                ).detach(),
+                f"two_stage_{task_name}_skip": masked_level_mean(
+                    two_stage_route[:, :, 0], task_idx
+                ).detach(),
+                f"two_stage_{task_name}_part": masked_level_mean(
+                    two_stage_route[:, :, 1], task_idx
+                ).detach(),
+                f"two_stage_{task_name}_relation": masked_level_mean(
+                    two_stage_route[:, :, 2], task_idx
+                ).detach(),
+                f"two_stage_{task_name}_active_rate": masked_level_mean(
+                    has_eligible.float(), task_idx
+                ).detach(),
+                f"two_stage_{task_name}_effective_budget": masked_level_mean(
+                    effective_budget, task_idx
+                ).detach(),
+                f"two_stage_{task_name}_gain_confidence": masked_level_mean(
+                    branch_confidence.max(dim=-1).values, task_idx
+                ).detach(),
+            })
+            for branch_idx, branch_name in enumerate(
+                ("skip", "part", "relation")
+            ):
+                stats[f"candidate_{task_name}_{branch_name}_rate"] = (
+                    best_branch[:, task_idx].eq(branch_idx).float()
+                    * task_mask[:, task_idx]
+                ).sum().div(
+                    task_mask[:, task_idx].sum().clamp_min(1.0)
+                ).detach()
+        part_task = weighted_task_reduce(branch_task_loss[:, :, 1])
+        relation_task = weighted_task_reduce(branch_task_loss[:, :, 2])
+        classification_before = weighted_task_reduce(
+            branch_classification_loss[:, :, 0]
+        )
+        part_classification = weighted_task_reduce(
+            branch_classification_loss[:, :, 1]
+        )
+        relation_classification = weighted_task_reduce(
+            branch_classification_loss[:, :, 2]
+        )
+        consistency_before = weighted_task_reduce(
+            branch_consistency_loss[:, :, 0]
+        )
+        part_consistency = weighted_task_reduce(
+            branch_consistency_loss[:, :, 1]
+        )
+        relation_consistency = weighted_task_reduce(
+            branch_consistency_loss[:, :, 2]
+        )
+        stats.update({
+            "meta_part_task_improvement": (task_before - part_task).detach(),
+            "meta_relation_task_improvement": (
+                task_before - relation_task
+            ).detach(),
+            "meta_part_classification_improvement": (
+                classification_before - part_classification
+            ).detach(),
+            "meta_relation_classification_improvement": (
+                classification_before - relation_classification
+            ).detach(),
+            "meta_part_consistency_improvement": (
+                consistency_before - part_consistency
+            ).detach(),
+            "meta_relation_consistency_improvement": (
+                consistency_before - relation_consistency
+            ).detach(),
+        })
+        stats.update(route_stats)
+        stats.update({"part_" + key: value for key, value in part_policy_stats.items()})
+        stats.update({"rel_" + key: value for key, value in relation_policy_stats.items()})
+        return meta_loss, stats, {
+            "branch_eligibility": branch_eligibility,
+            "branch_confidence": branch_confidence,
+        }
+
     def _counterfactual_meta_objective(
         self,
         support: Dict[str, torch.Tensor],
@@ -1661,6 +2264,7 @@ class BilevelSemanticController(nn.Module):
         safe_confidence_budget: bool = True,
         consistency_credit_weight: float = 0.25,
         counterfactual_compose: str = "competitive",
+        counterfactual_solver: str = "unified",
         relation_residual_inner_scale: float = 0.5,
         species_no_regret_margin: float = 0.01,
         species_anchor_kl_margin: float = 0.01,
@@ -1674,16 +2278,16 @@ class BilevelSemanticController(nn.Module):
         reference distribution, so no learned weight multiplies its raw error.
         """
         self._check_scope(scope)
+        if counterfactual_solver not in ("unified", "v85-frozen"):
+            raise ValueError(
+                "counterfactual solver must be 'unified' or 'v85-frozen'"
+            )
         if scope == "counterfactual":
-            result = self._counterfactual_meta_objective(
-                support=support,
-                query=query,
-                inner_lr=inner_lr,
-                q_mode=q_mode,
-                kl_weight=kl_weight,
+            common_args = dict(
+                support=support, query=query, inner_lr=inner_lr,
+                q_mode=q_mode, kl_weight=kl_weight,
                 relation_weight=relation_weight,
-                outer_task_fn=outer_task_fn,
-                task_weight=task_weight,
+                outer_task_fn=outer_task_fn, task_weight=task_weight,
                 semantic_weight=semantic_weight,
                 router_kl_weight=router_kl_weight,
                 task_level_weights=task_level_weights,
@@ -1696,12 +2300,28 @@ class BilevelSemanticController(nn.Module):
                 safe_confidence_scale=safe_confidence_scale,
                 safe_confidence_budget=safe_confidence_budget,
                 consistency_credit_weight=consistency_credit_weight,
-                counterfactual_compose=counterfactual_compose,
-                relation_residual_inner_scale=relation_residual_inner_scale,
-                species_no_regret_margin=species_no_regret_margin,
-                species_anchor_kl_margin=species_anchor_kl_margin,
                 safe_gate=safe_gate,
             )
+            if counterfactual_solver == "v85-frozen":
+                if counterfactual_compose != "competitive":
+                    raise ValueError(
+                        "v85-frozen solver requires competitive composition"
+                    )
+                result = self._counterfactual_meta_objective_v85(
+                    **common_args
+                )
+                result[1]["counterfactual_solver_v85_frozen"] = 1.0
+            else:
+                result = self._counterfactual_meta_objective(
+                    **common_args,
+                    counterfactual_compose=counterfactual_compose,
+                    relation_residual_inner_scale=(
+                        relation_residual_inner_scale
+                    ),
+                    species_no_regret_margin=species_no_regret_margin,
+                    species_anchor_kl_margin=species_anchor_kl_margin,
+                )
+                result[1]["counterfactual_solver_v85_frozen"] = 0.0
             return result if return_aux else result[:2]
         use_part = scope in ("part", "hybrid", "adaptive")
         use_relation = scope in ("relation", "hybrid", "adaptive")
@@ -1853,6 +2473,158 @@ class BilevelSemanticController(nn.Module):
         if return_aux:
             return meta_loss, stats, {}
         return meta_loss, stats
+
+    # Frozen V8.5 real-update path paired with the frozen meta solver.
+    def real_weighted_alignment_v85(
+        self, state: Dict[str, torch.Tensor], scope: str = "adaptive",
+        relation_weight: float = 1.0,
+        task_level_weights: Tuple[float, float, float] = (1.0, 0.5, 0.5),
+        branch_eligibility: Optional[torch.Tensor] = None,
+        branch_confidence: Optional[torch.Tensor] = None,
+        safe_route_budget: float = 0.05,
+        safe_confidence_scale: float = 1.0,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Real shared-adapter loss with every learned policy detached."""
+        self._check_scope(scope)
+        use_part = scope in ("part", "hybrid", "adaptive", "counterfactual")
+        use_relation = scope in (
+            "relation", "hybrid", "adaptive", "counterfactual"
+        )
+        adapted = self.adapt_parts(state["part_tokens"])
+        part_error = self._direct_alignment_error(
+            adapted, state["target_semantics"]
+        )
+        if use_part:
+            part_policy, part_stats = self.policy_distribution(
+                state["part_tokens"], state["policy_semantics"],
+                state["curvature"],
+            )
+            part_loss = (
+                self.num_parts * part_policy.detach() * part_error
+            ).mean(dim=1)
+        else:
+            part_loss = part_error.new_zeros(part_error.size(0))
+            part_stats = {}
+
+        relation_error = None
+        relation_curvature = None
+        if use_relation:
+            relation_state = state["relation_state"]
+            relation_tokens = self.relation_encoder.visual_relations(
+                adapted,
+                relation_state["part_attn"].to(dtype=adapted.dtype),
+            )[0]
+            relation_error = self.relation_alignment_error(
+                relation_tokens, relation_state["target_semantics"]
+            )
+            relation_curvature = relation_state["curvature"]
+            relation_policy, relation_stats = self._stopped_policy_distribution(
+                self.relation_policy,
+                relation_tokens,
+                relation_state["policy_semantics"],
+                relation_curvature,
+            )
+            relation_loss = (
+                self.num_relations * relation_policy.detach() * relation_error
+            ).mean(dim=1)
+        else:
+            relation_loss = part_loss.new_zeros(part_loss.shape)
+            relation_stats = {}
+
+        if scope == "counterfactual":
+            if self.router.num_tasks != 3:
+                raise RuntimeError(
+                    "controller was not constructed with "
+                    "routing_scope='counterfactual'"
+                )
+            task_route, route_stats = self.router(
+                part_error.detach(), relation_error.detach(),
+                state["curvature"].detach(), relation_curvature.detach(),
+            )
+            (
+                task_route,
+                conditional_route,
+                has_eligible,
+                effective_budget,
+            ) = self._two_stage_counterfactual_route(
+                task_route,
+                branch_eligibility,
+                non_skip_budget=safe_route_budget,
+                branch_confidence=branch_confidence,
+                confidence_scale=safe_confidence_scale,
+            )
+            safe_entropy = -(
+                task_route * task_route.clamp_min(1.0e-8).log()
+            ).sum(dim=-1)
+            route_stats.update({
+                "safe_route_skip": task_route[:, :, 0].mean().detach(),
+                "safe_route_part": task_route[:, :, 1].mean().detach(),
+                "safe_route_relation": task_route[:, :, 2].mean().detach(),
+                "safe_route_entropy": safe_entropy.mean().detach(),
+                "safe_route_active_rate": has_eligible.float().mean().detach(),
+                "safe_route_effective_budget": effective_budget.mean().detach(),
+                "conditional_route_part": (
+                    conditional_route[:, :, 0].mean().detach()
+                ),
+                "conditional_route_relation": (
+                    conditional_route[:, :, 1].mean().detach()
+                ),
+            })
+            for task_idx, task_name in enumerate(
+                AdaptiveGranularityRouter.TASK_NAMES
+            ):
+                route_stats.update({
+                    f"safe_route_{task_name}_skip": (
+                        task_route[:, task_idx, 0].mean().detach()
+                    ),
+                    f"safe_route_{task_name}_part": (
+                        task_route[:, task_idx, 1].mean().detach()
+                    ),
+                    f"safe_route_{task_name}_relation": (
+                        task_route[:, task_idx, 2].mean().detach()
+                    ),
+                    f"safe_route_{task_name}_active_rate": (
+                        has_eligible[:, task_idx].float().mean().detach()
+                    ),
+                    f"safe_route_{task_name}_effective_budget": (
+                        effective_budget[:, task_idx].mean().detach()
+                    ),
+                    f"conditional_route_{task_name}_part": (
+                        conditional_route[:, task_idx, 0].mean().detach()
+                    ),
+                    f"conditional_route_{task_name}_relation": (
+                        conditional_route[:, task_idx, 1].mean().detach()
+                    ),
+                })
+            level_weights = torch.as_tensor(
+                task_level_weights, device=task_route.device,
+                dtype=task_route.dtype,
+            )
+            if level_weights.numel() != 3 or (level_weights < 0).any():
+                raise ValueError(
+                    "task_level_weights must contain three nonnegative values"
+                )
+            route = (
+                task_route * level_weights.view(1, 3, 1)
+            ).sum(dim=1) / level_weights.sum().clamp_min(1.0e-8)
+        else:
+            route, route_stats = self._route(
+                scope, part_error.detach(),
+                relation_error.detach() if relation_error is not None else None,
+                state["curvature"].detach(),
+                relation_curvature.detach() if relation_curvature is not None else None,
+            )
+        loss = (
+            route[:, 1].detach() * part_loss
+            + route[:, 2].detach() * float(relation_weight) * relation_loss
+        ).mean()
+        stats: Dict[str, torch.Tensor] = {
+            "meta_real_align": loss.detach(),
+            **route_stats,
+        }
+        stats.update({"part_" + key: value for key, value in part_stats.items()})
+        stats.update({"rel_" + key: value for key, value in relation_stats.items()})
+        return loss, stats
 
     def real_weighted_alignment(
         self, state: Dict[str, torch.Tensor], scope: str = "adaptive",
